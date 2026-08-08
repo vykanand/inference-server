@@ -998,7 +998,21 @@ async def v1_chat_completions(request: Request):
                     idx = i
                     break
             names = _tool_names(payload["tools"])
+            # Build project-context prefix (OS, dir, git status, languages)
+            try:
+                pc_parts = ["CWD: %s" % os.getcwd(), "OS: Windows"]
+                import glob
+                py_files = len(glob.glob("**/*.py", recursive=True))
+                js_files = len(glob.glob("**/*.{js,ts,tsx,jsx}", recursive=True))
+                if py_files: pc_parts.append("Python files: %d" % py_files)
+                if js_files: pc_parts.append("JS/TS files: %d" % js_files)
+                gf = ".git" if os.path.isdir(".git") else None
+                if gf: pc_parts.append("Git repo: yes")
+                project_ctx = "ENV: " + " | ".join(pc_parts) + "\n"
+            except Exception:
+                project_ctx = ""
             tool_hint = (
+                project_ctx +
                 "SYSTEM: You are a tool-calling coding agent. You MUST call tools "
                 "to do every task. Never DESCRIBE what you would do — actually DO it.\n"
                 "Tool format: ```json\n{\"name\":\"<tool>\",\"arguments\":{}}\n```\n"
@@ -1106,12 +1120,15 @@ async def v1_chat_completions(request: Request):
                             if c:
                                 c = _sanitize_content(c)
                                 content_chars += len(c)
+                                buf.append(c)
+                                # Progressive streaming: emit content live for
+                                # word-by-word display. Buffer maintained for
+                                # end-of-stream tool-call detection.
                                 if saw_native:
-                                    # Re-update obj with sanitized content
                                     (obj.get("choices") or [{}])[0].get("delta", {})["content"] = c
                                     yield "data: " + json.dumps(obj) + "\n\n"
                                 else:
-                                    buf.append(c)
+                                    yield _sse_chunk(content=c)
                             fr = delta.get("finish_reason")
                             if fr:
                                 saw_finish = fr
