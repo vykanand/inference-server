@@ -377,16 +377,12 @@ def _default_model_path():
                 return f
     for f in found:
         low = f.lower()
-        if "phi" in low and "instruct" in low and "mini" in low:
-            return f  # Phi-4-mini: best multi-turn tool calling on 4 GB
-    for f in found:
-        low = f.lower()
-        if "phi" in low and "instruct" in low:
-            return f
-    for f in found:
-        low = f.lower()
         if "coder" in low and "instruct" in low:
-            return f  # Qwen2.5-Coder: good code, weaker multi-turn
+            return f  # Qwen2.5-Coder: best tool-calling at any temp
+    for f in found:
+        low = f.lower()
+        if "phi" in low and "instruct" in low and "mini" in low:
+            return f  # Phi-4-mini: good multi-turn, weaker tool names
     for f in found:
         low = f.lower()
         if "instruct" in low:
@@ -914,10 +910,27 @@ async def v1_chat_completions(request: Request):
     if isinstance(messages, list) and messages:
         # Round-trip fix: llama-server cannot ingest OpenAI tool_calls /
         # role:"tool" messages directly. Normalize them to plain text so
-        # multi-turn tool use works. This is the ONLY message transformation —
-        # we never modify system prompts, tool definitions, or parameters.
+        # multi-turn tool use works.
         if _has_tool_messages(messages):
             messages = _normalize_messages(messages)
+        # Minimal hint: append a tool output format reminder without replacing
+        # the client's system prompt. Needed because these GGUFs lack chat
+        # templates — llama-server's default template omits tool format.
+        # 60 chars, non-invasive, never overwrites client content.
+        if payload.get("tools") and _tool_names(payload["tools"]):
+            idx = None
+            for i in range(len(messages)):
+                if messages[i].get("role") == "system":
+                    idx = i
+                    break
+            names = _tool_names(payload["tools"])
+            tool_hint = "\n[Tools: %s. Format: {\"name\":\"x\",\"arguments\":{}}]" % ", ".join(names[:15])
+            if idx is not None:
+                if tool_hint not in str(messages[idx].get("content", "")):
+                    messages[idx] = dict(messages[idx])
+                    messages[idx]["content"] = str(messages[idx].get("content", "")) + tool_hint
+            else:
+                messages.insert(0, {"role": "system", "content": "[Call tools with: ```json\n{\"name\":\"x\",\"arguments\":{}}\n```]\n"})
         payload["messages"] = messages
         truncated, was_truncated, freed = truncate_messages(messages, budget)
         payload["messages"] = truncated
