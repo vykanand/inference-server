@@ -1140,8 +1140,8 @@ async def v1_chat_completions(request: Request):
                                 seg = _split_tool_and_text(full, tools)
                                 if seg:
                                     before, tcs, after = seg
-                                    if before:
-                                        yield _sse_chunk(content=before)
+                                    # Content was already live-emitted via progressive
+                                    # streaming. Only emit tool_calls + trailing text.
                                     if tcs:
                                         valid_names = _tool_names(tools)
                                         valid_tcs = [(n, a) for n, a in tcs if n in valid_names]
@@ -1158,8 +1158,12 @@ async def v1_chat_completions(request: Request):
                                             yield _sse_chunk(finish="stop")
                                     if after:
                                         yield _sse_chunk(content=after, finish="stop")
+                                    elif not tcs:
+                                        if not saw_finish:
+                                            yield _sse_chunk(finish="stop")
                                 else:
-                                    yield _sse_chunk(content=full, finish="stop")
+                                    if not saw_finish:
+                                        yield _sse_chunk(finish="stop")
                             else:
                                 yield _sse_chunk(finish="stop")
                         elif has_tools and saw_native:
