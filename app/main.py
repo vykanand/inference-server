@@ -1169,6 +1169,7 @@ async def v1_chat_completions(request: Request):
                                 yield "data: " + json.dumps(obj) + "\n\n"
                                 continue
                             c = delta.get("content")
+                            fr = (obj.get("choices") or [{}])[0].get("finish_reason")
                             if c:
                                 c = _sanitize_content(c)
                                 content_chars += len(c)
@@ -1183,7 +1184,6 @@ async def v1_chat_completions(request: Request):
                                     else:
                                         yield _sse_chunk(content=c)
                                 # else: already in buffering mode — accumulate only
-                                fr = (obj.get("choices") or [{}])[0].get("finish_reason")
                             if fr:
                                 saw_finish = fr
 
