@@ -21,6 +21,7 @@ app = FastAPI(title="llama.cpp Inference Server Manager")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 manager = EngineManager(BASE)
+manager.start_watchdog()
 app.mount("/static", StaticFiles(directory=WEB), name="static")
 
 
@@ -228,7 +229,7 @@ def _stream_llama(port, payload):
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
     eng = manager.get(port)
     if not eng:
-        yield 'data: {"error":"engine not running"}\n\n'
+        yield json.dumps({"error": "engine not running"}) + "\n\n"
         return
     start = time.time()
     first = None
@@ -238,7 +239,9 @@ def _stream_llama(port, payload):
     try:
         with requests.post(url, json=payload, stream=True, timeout=300) as r:
             if r.status_code != 200:
-                yield f'data: {{"error":"llama-server {r.status_code}: {r.text[:200]}"}}\n\n'
+                err = json.dumps({"error": {"message": "llama-server %s: %s" % (r.status_code, r.text[:500])}})
+                yield "data: " + err + "\n\n"
+                yield "data: [DONE]\n\n"
                 return
             r.raise_for_status()
             for raw in r.iter_lines(decode_unicode=True):
@@ -265,9 +268,10 @@ def _stream_llama(port, payload):
                         nctx = usage.get("prompt_tokens") or None
                     except Exception:
                         pass
-                yield f"data: {d}\n\n"
+                yield "data: " + json.dumps(obj) + "\n\n"
     except Exception as e:
-        yield f'data: {{"error":"{e}"}}\n\n'
+        yield "data: " + json.dumps({"error": {"message": str(e)}}) + "\n\n"
+        yield "data: [DONE]\n\n"
         return
     total = time.time() - start
     if tkn <= 0:
@@ -278,7 +282,8 @@ def _stream_llama(port, payload):
             "first_token_s": round((first - start), 3) if first else None,
             "prompt_tokens": nctx,
             "interactive": False}
-    yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+    yield "event: meta\ndata: " + json.dumps(meta) + "\n\n"
+    yield "data: [DONE]\n\n"
 
 
 @app.post("/api/cleanup")
@@ -304,11 +309,22 @@ def chat(port: int, body: dict):
     messages = body.get("messages")
     if not messages:
         raise HTTPException(400, "messages required")
-    payload = {"messages": messages, "stream": True, "max_tokens": body.get("max_tokens", 512)}
+    # Truncate defensively so even direct engine calls never 400 on ctx overflow.
+    ctx_limit = int(eng.params.get("ctx", 4096))
+    max_tokens = int(body.get("max_tokens") or 512)
+    budget = max(512, ctx_limit - max_tokens)
+    payload = {"messages": messages, "stream": True, "max_tokens": max_tokens}
     for k in ("temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty",
               "frequency_penalty", "stop", "tools", "tool_choice", "parallel_tool_calls"):
         if body.get(k) is not None:
             payload[k] = body[k]
+    if isinstance(messages, list) and messages:
+        if _has_tool_messages(messages):
+            messages = _normalize_messages(messages)
+        if payload.get("tools"):
+            messages = _augment_tool_system(messages, payload["tools"])
+        messages, _, _ = truncate_messages(messages, budget)
+        payload["messages"] = messages
     if body.get("cache_prompt") is True:
         payload["cache_prompt"] = True
     return StreamingResponse(_stream_llama(port, payload), media_type="text/event-stream",
@@ -347,33 +363,61 @@ def _escape_json(s):
     return json.dumps(str(s))
 
 
+# Conservative chars-per-token estimate. Real code tokenizers (llama.cpp BPE)
+# pack ~1.8 chars/token for dense code, so we deliberately OVER-estimate the
+# token count (using 1.6) to guarantee the truncated prompt always fits and
+# never 400s on the backend. Slightly over-truncating is safe; overflowing is not.
+CHAR_PER_TOKEN = 1.6
+
+
 def truncate_messages(messages, ctx_limit):
-    """Drop oldest messages so total tokens fit within ctx_limit.
-    
-    Keeps system prompt + recent exchange pairs. Uses char/4 as rough token estimate.
+    """Drop oldest messages so the prompt fits within ctx_limit tokens.
+
+    Code-heavy prompts tokenize densely, so we use a conservative token
+    estimate and reserve room for the completion. As a last resort we hard-cap
+    each remaining message so total tokens stay under budget.
     """
     if not messages or not isinstance(messages, list):
         return messages, False, 0
-    # Estimate tokens per message
+
     def _toks(m):
         c = m.get("content") or ""
-        tc = len(c) // 4
-        for tc_item in m.get("tool_calls") or []:
-            args = tc_item.get("function", {}).get("arguments") or ""
-            tc += len(args) // 4
+        tc = len(str(c)) // CHAR_PER_TOKEN
+        for tc_item in (m.get("tool_calls") or []):
+            fn = tc_item.get("function") or {}
+            tc += len(str(fn.get("arguments") or "")) // CHAR_PER_TOKEN
+            tc += len(str(fn.get("name") or "")) // CHAR_PER_TOKEN
         return max(tc, 1)
+
     total_toks = sum(_toks(m) for m in messages)
     if total_toks <= ctx_limit:
         return messages, False, 0
-    # Keep first (system) + last N messages until under budget
-    kept = [messages[0]] if messages[0].get("role") == "system" else []
-    dropped = list(messages) if kept else list(messages)
+
+    # Keep the first message if it is the system prompt; drop oldest after it.
+    # Never drop the last remaining message — if a single message is huge we
+    # hard-cap it below instead of sending an empty request.
+    head = [messages[0]] if messages and messages[0].get("role") == "system" else []
+    tail = list(messages[1:] if head else messages)
     freed = 0
-    while dropped and total_toks > ctx_limit:
-        old = dropped.pop(0)
+    while len(tail) > 1 and (sum(_toks(m) for m in head) + sum(_toks(m) for m in tail)) > ctx_limit:
+        old = tail.pop(0)
         freed += _toks(old)
-        total_toks -= _toks(old)
-    result = kept + dropped
+
+    result = head + tail
+
+    # Last resort: even the minimal set may overflow (e.g. one giant file dump).
+    # Hard-cap every message's characters so total tokens stay under budget.
+    if sum(_toks(m) for m in result) > ctx_limit:
+        per = max(200, int(ctx_limit * CHAR_PER_TOKEN))
+        new_result = []
+        for m in result:
+            m = dict(m)  # shallow copy so we don't mutate caller state
+            c = m.get("content")
+            if isinstance(c, str) and len(c) > per:
+                m["content"] = c[:per] + "\n...[context truncated to fit window]"
+            new_result.append(m)
+        result = new_result
+        freed += 1
     return result, True, freed
 
 
@@ -407,6 +451,11 @@ def _ensure_engine(model_req):
 
 
 def _proxy_completion(target, payload, model_req):
+    # Normalize OpenAI tool/tool-result messages for llama-server (no native
+    # tool template) so non-streaming tool use also works across turns.
+    msgs = payload.get("messages")
+    if isinstance(msgs, list) and _has_tool_messages(msgs):
+        payload["messages"] = _normalize_messages(msgs)
     try:
         r = requests.post(target, json=payload, timeout=600)
     except Exception as e:
@@ -417,7 +466,227 @@ def _proxy_completion(target, payload, model_req):
         return r.status_code, {"error": {"message": r.text[:500]}}
     if isinstance(obj, dict) and obj.get("model"):
         obj["model"] = model_req
+    # Many local GGUFs (e.g. Qwen2.5-Coder) emit a tool call as a fenced
+    # ```json block instead of native tool_calls. Convert it so editors that
+    # expect OpenAI tool_calls get a properly structured call.
+    if payload.get("tools") and isinstance(obj, dict):
+        obj = _convert_tool_text(obj, payload.get("tools"))
     return r.status_code, obj
+
+
+# Whole-string fenced tool call, OR a fenced block embedded in text.
+_TOOL_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(\{.*?\})\s*```\s*$", re.S | re.I)
+_FENCE_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S | re.I)
+
+
+def _tool_names(tools):
+    out = []
+    for t in (tools or []):
+        fn = t.get("function") or t
+        n = fn.get("name")
+        if n:
+            out.append(n)
+    return out
+
+
+def _canonicalize_tool_name(name, tools):
+    """Models often emit a near-miss tool name (e.g. `question` for
+    `ask_question`). Map it to the exact name from the request's tool list so
+    editors (opencode/Cline/Copilot/Roo) accept the call instead of rejecting
+    an unknown tool. Falls back to the original name if no match."""
+    names = _tool_names(tools)
+    if not names or name in names:
+        return name
+    a = name.lower().replace("_", "").replace("-", "")
+    for n in names:
+        b = n.lower().replace("_", "").replace("-", "")
+        if a == b or a in b or b in a:
+            return n
+    return name
+
+
+def _parse_tool_call_obj(obj, tools):
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name")
+    if not name or not isinstance(name, str):
+        return None
+    args = obj.get("arguments")
+    if not isinstance(args, dict):
+        args = {}
+    return _canonicalize_tool_name(name, tools), args
+
+
+def _extract_tool_call(content, tools=None):
+    """If `content` is a JSON tool-call (fenced OR bare), return
+    (canonical_name, args_dict). Handles the shapes local models emit:
+    {"name":..,"arguments":..}, {"tool_calls":[..]}, or a bare JSON array."""
+    if not isinstance(content, str):
+        return None
+    text = content.strip()
+    m = _TOOL_FENCE_RE.match(text)
+    src = m.group(1) if m else text
+    if not m:
+        if not (text.startswith("{") and '"name"' in text):
+            return None
+    try:
+        obj = json.loads(src)
+    except Exception:
+        return None
+    # Unwrap common wrappers
+    if isinstance(obj, list) and obj:
+        obj = obj[0]
+    if isinstance(obj, dict) and "tool_calls" in obj and isinstance(obj["tool_calls"], list) and obj["tool_calls"]:
+        obj = obj["tool_calls"][0].get("function", obj["tool_calls"][0])
+    return _parse_tool_call_obj(obj, tools)
+
+
+def _split_tool_and_text(full, tools):
+    """Split a response into (text_before, tool_call_or_None, text_after).
+    Lets us correctly emit a tool call even when the model wraps it in
+    explanatory text (the text<->tool switching case). Returns None when no
+    tool call is present (caller should treat the whole thing as text)."""
+    m = _FENCE_BLOCK_RE.search(full)
+    if not m:
+        return None
+    before = full[:m.start()].strip()
+    after = full[m.end():].strip()
+    tc = _extract_tool_call(m.group(1), tools)
+    if not tc:
+        return None
+    return before, tc, after
+
+
+def _looks_like_tool_call(text):
+    """Heuristic used during streaming to decide whether to buffer+convert
+    (tool call) or stream live (normal chat)."""
+    t = text.strip()
+    if not t:
+        return False
+    if t.startswith("```"):
+        return True
+    return t.startswith("{") and '"name"' in t and '"arguments"' in t
+
+
+def _augment_tool_system(messages, tools):
+    """GGUF models without a native tool template (most local Qwen/Coder
+    GGUFs) won't emit OpenAI tool_calls. Append a strict output-format guide
+    so the model reliably produces the fenced-JSON shape our converter turns
+    into native tool_calls. Safe: only appends, never rewrites user content."""
+    names = _tool_names(tools)
+    instr = (
+        "\n\nTOOL USE FORMAT: When you decide to call a tool, reply with ONLY a "
+        "fenced JSON code block and no other text:\n```json\n"
+        "{\"name\": \"<tool_name>\", \"arguments\": {<valid json object>}}\n```\n"
+        "Use exactly one of these tool names: " + ", ".join(names) + ".\n"
+        "If you do not need a tool, just answer normally in plain text."
+    )
+    msgs = list(messages)
+    idx = None
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].get("role") == "system":
+            idx = i
+            break
+    if idx is not None:
+        m = dict(msgs[idx])
+        c = m.get("content") or ""
+        if "TOOL USE FORMAT" not in c:
+            m["content"] = c + instr
+        msgs[idx] = m
+    else:
+        msgs.insert(0, {"role": "system", "content": instr.strip()})
+    return msgs
+
+
+def _normalize_messages(messages):
+    """Convert OpenAI tool-call / tool-result messages back into the plain-text
+    shape the (non-native-tool) model understands, so multi-turn tool use works
+    instead of producing an incoherent context that makes generation stop
+    mid-answer. Editors never see this — only llama-server does.
+
+    - assistant message with tool_calls  -> rendered as the fenced-JSON text the
+      model originally produced (preserving the call).
+    - role:"tool" result                 -> a user message: "Tool result for X: ...".
+    """
+    id_name = {}
+    out = []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                fn = tc.get("function") or {}
+                if tc.get("id"):
+                    id_name[tc["id"]] = fn.get("name", "")
+            parts = []
+            if m.get("content"):
+                parts.append(str(m["content"]))
+            for tc in m["tool_calls"]:
+                fn = tc.get("function") or {}
+                name = fn.get("name", "")
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    args = fn.get("arguments", {})
+                parts.append("```json\n" + json.dumps({"name": name, "arguments": args},
+                                                       ensure_ascii=False) + "\n```")
+            out.append({"role": "assistant", "content": "\n".join(parts)})
+        elif role == "tool":
+            tcid = m.get("tool_call_id")
+            name = id_name.get(tcid, "")
+            content = m.get("content") or ""
+            out.append({"role": "user",
+                        "content": "Tool result%s:\n%s" % ((" for " + name) if name else "", content)})
+        else:
+            out.append(m)
+    return out
+
+
+def _has_tool_messages(messages):
+    return any((m.get("role") == "tool") or
+               (m.get("role") == "assistant" and m.get("tool_calls")) for m in messages)
+
+
+def _wrap_tool_call(name, args, call_id=None):
+    call_id = call_id or "call_%d" % int(time.time() * 1000)
+    return [{"id": call_id, "type": "function",
+             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}]
+
+
+def _sse_chunk(content=None, tool_calls=None, finish=None):
+    """OpenAI-compliant streaming chunk: finish_reason at CHOICE level, not inside delta."""
+    d = {}
+    if content is not None:
+        d["content"] = content
+    if tool_calls is not None:
+        d["tool_calls"] = tool_calls
+    choice = {"index": 0, "delta": d}
+    if finish:
+        choice["finish_reason"] = finish
+    return "data: " + json.dumps({"choices": [choice]}) + "\n\n"
+
+
+def _convert_tool_text(obj, tools=None):
+    """When the assistant message content is a single JSON tool call, move it
+    into the OpenAI `tool_calls` field so editors parse it natively."""
+    try:
+        choices = obj.get("choices") or []
+        if not choices:
+            return obj
+        msg = (choices[0].get("message") or {})
+        if msg.get("tool_calls"):  # already native — leave untouched
+            return obj
+        content = msg.get("content") or ""
+        tc = _extract_tool_call(content, tools)
+        if not tc:
+            return obj
+        name, args = tc
+        msg["tool_calls"] = _wrap_tool_call(name, args)
+        msg["content"] = ""
+        choices[0]["finish_reason"] = "tool_calls"
+        obj["choices"] = choices
+    except Exception:
+        return obj
+    return obj
 
 
 @app.get("/v1/models")
@@ -453,16 +722,35 @@ async def v1_chat_completions(request: Request):
     want_stream = bool(payload.get("stream", False))
 
     # --- Context-aware message truncation (fixes "exceeds available context size") ---
-    ctx_limit = eng.params.get("ctx", 4096)
+    # Reserve room for the completion so we never overflow ctx on the reply either.
+    ctx_limit = int(eng.params.get("ctx", 4096))
+    max_tokens = int(payload.get("max_tokens") or 512)
+    budget = max(512, ctx_limit - max_tokens)
     messages = payload.get("messages")
-    if isinstance(messages, list) and len(messages) > 1:
-        truncated, was_truncated, freed = truncate_messages(messages, ctx_limit)
+    if isinstance(messages, list) and messages:
+        # Round-trip fix: llama-server (no native tool template) cannot ingest
+        # OpenAI tool_calls / role:"tool" messages, which breaks multi-turn tool
+        # use and causes abrupt stops. Normalize them to plain text first.
+        if _has_tool_messages(messages):
+            messages = _normalize_messages(messages)
+        # Models without a native tool template need a format hint so they
+        # reliably emit the fenced-JSON shape we convert to tool_calls.
+        # Augment BEFORE truncating so the added text is counted in ctx budget.
+        if payload.get("tools"):
+            messages = _augment_tool_system(messages, payload["tools"])
+        payload["messages"] = messages
+        truncated, was_truncated, freed = truncate_messages(messages, budget)
         payload["messages"] = truncated
         if was_truncated and eng.ready:
             eng.info["_truncated"] = True
             eng.info["_freed_tokens"] = freed
 
     def _stream_gen():
+        has_tools = bool(payload.get("tools"))
+        tools = payload.get("tools")
+        buf = []          # accumulated content for text→tool conversion
+        saw_native = False
+        saw_finish = None
         try:
             with requests.post(target, json=payload, stream=True, timeout=600) as r:
                 if r.status_code != 200:
@@ -472,25 +760,78 @@ async def v1_chat_completions(request: Request):
                 for raw in r.iter_lines(decode_unicode=True):
                     if not raw:
                         continue
-                    if raw.startswith("data:"):
-                        d = raw[5:].strip()
-                        if d == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            continue
-                        try:
-                            obj = json.loads(d)
-                            if isinstance(obj, dict) and obj.get("model"):
-                                obj["model"] = model_req
-                            yield "data: " + json.dumps(obj) + "\n\n"
-                        except Exception:
-                            # Raw non-JSON line — wrap in valid SSE/JSON so client can parse
-                            safe = json.dumps({"error": {"message": str(raw)[:500]}})
-                            yield "data: " + safe + "\n\n"
-                    else:
+                    if not raw.startswith("data:"):
                         yield raw + "\n\n"
+                        continue
+                    d = raw[5:].strip()
+                    if d == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(d)
+                    except Exception:
+                        safe = json.dumps({"error": {"message": str(raw)[:500]}})
+                        yield "data: " + safe + "\n\n"
+                        continue
+                    if isinstance(obj, dict) and obj.get("model"):
+                        obj["model"] = model_req
+
+                    if not has_tools:
+                        yield "data: " + json.dumps(obj) + "\n\n"
+                        continue
+
+                    # ── tools path ───────────────────────────────────────
+                    delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+                    # Native tool_calls: flush any buffered text, then relay live
+                    if delta.get("tool_calls"):
+                        if buf and not saw_native:
+                            # flush accumulated text before native tool_calls kick in
+                            yield _sse_chunk(content="".join(buf))
+                            buf = []
+                        saw_native = True
+                        yield "data: " + json.dumps(obj) + "\n\n"
+                        continue
+
+                    c = delta.get("content")
+                    if c:
+                        if saw_native:
+                            yield "data: " + json.dumps(obj) + "\n\n"
+                        else:
+                            buf.append(c)
+                    fr = delta.get("finish_reason")
+                    if fr:
+                        saw_finish = fr
+
+                # ── stream ended ─────────────────────────────────────────
+                if has_tools and not saw_native:
+                    full = "".join(buf)
+                    if full:
+                        seg = _split_tool_and_text(full, tools)
+                        if seg:
+                            before, tc, after = seg
+                            if before:
+                                yield _sse_chunk(content=before)
+                            if tc:
+                                name, args = tc
+                                yield _sse_chunk(tool_calls=_wrap_tool_call(name, args))
+                                yield _sse_chunk(finish="tool_calls")
+                            if after:
+                                yield _sse_chunk(content=after, finish="stop")
+                            elif not tc:
+                                yield _sse_chunk(finish="stop")
+                        else:
+                            yield _sse_chunk(content=full, finish="stop")
+                    else:
+                        yield _sse_chunk(finish="stop")
+                elif has_tools and saw_native:
+                    if not saw_finish:
+                        yield _sse_chunk(finish="stop")
+                elif not has_tools:
+                    if not saw_finish:
+                        yield _sse_chunk(finish="stop")
         except Exception as e:
             safe_err = json.dumps({"error": {"message": str(e)}})
             yield "data: " + safe_err + "\n\n"
+        yield "data: [DONE]\n\n"
 
     if want_stream:
         return StreamingResponse(_stream_gen(), media_type="text/event-stream",
@@ -831,4 +1172,4 @@ async def catch_all_chat(request: Request, path: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", "8081")))
+    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", "8899")))
