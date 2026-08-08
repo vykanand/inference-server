@@ -77,27 +77,35 @@ def search(q, limit=60, token=None):
 
 
 def repo_tree(repo_id, token=None, timeout=15):
-    """GGUF files with real byte sizes from the HF tree API (cached)."""
+    """GGUF files with real byte sizes from the HF tree API (cached, retried)."""
     key = f"{repo_id}|{bool(token)}"
     with _tree_lock:
         if key in _tree_cache:
             return _tree_cache[key]
-    try:
-        r = requests.get(HF_TREE.format(repo=repo_id), headers=_headers(token), timeout=timeout)
-        if r.status_code != 200:
-            files = []
-        else:
-            files = []
-            for e in r.json():
-                p = e.get("path", "")
-                if p.lower().endswith(".gguf") and not p.endswith(".part"):
-                    files.append({"name": p, "size": e.get("size", 0)})
-        files.sort(key=lambda f: f["name"])
-        with _tree_lock:
-            _tree_cache[key] = files
-        return files
-    except Exception:
-        return []
+    files = None
+    for attempt in range(3):
+        try:
+            r = requests.get(HF_TREE.format(repo=repo_id), headers=_headers(token), timeout=timeout)
+            if r.status_code == 200:
+                for e in r.json():
+                    p = e.get("path", "")
+                    if p.lower().endswith(".gguf") and not p.endswith(".part"):
+                        files = (files or []) + [{"name": p, "size": e.get("size", 0)}]
+                break
+            elif r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            else:
+                files = files or []
+                break
+        except Exception:
+            time.sleep(0.5)
+            continue
+    files = files or []
+    files.sort(key=lambda f: f["name"])
+    with _tree_lock:
+        _tree_cache[key] = files
+    return files
 
 
 def _has_tool_template(repo_id):
@@ -105,42 +113,48 @@ def _has_tool_template(repo_id):
     return not any(x in low for x in ["base", "raw", "pretrain", "-embed", "non-chat"])
 
 
-def compatible(vram_mb, limit=24, token=None, ctx_estimate_mb=900):
+def compatible(vram_mb, limit=24, token=None, ctx_estimate_mb=0):
     """Auto-populated list of instruct/agent-ready GGUF repos, enriched with real
-    file sizes and a GPU-fit rating so only fully-compatible models are shown."""
-    usable = max(0.0, vram_mb - ctx_estimate_mb) / 1024.0  # GiB headroom for KV + buffers
+    file sizes and a GPU-fit rating so ONLY fully-compatible models are shown.
+    A model is compatible when its largest GGUF <= usable VRAM."""
+    usable = max(0.0, vram_mb - ctx_estimate_mb - 300) / 1024.0  # KiB headroom for KV + buffers
     rows = []
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(repo_tree, r, token): r for r in COMPATIBLE_SEEDS}
-        sizes = {r: f.result() for r, f in ((fut, f) for fut in futs)}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fut_to_repo = {ex.submit(repo_tree, r, token): r for r in COMPATIBLE_SEEDS}
+        sizes = {r: fut.result() for fut, r in fut_to_repo.items()}
     for repo in COMPATIBLE_SEEDS:
         files = sizes[repo]
         if not files or not _has_tool_template(repo):
             continue
+        gguf = [f for f in files if f["size"] > 0]
+        if not gguf:
+            continue
+        gguf.sort(key=lambda f: f["size"])
         best = None
-        for f in files:
+        for f in gguf:  # pick the LARGEST quant that still fits ONCE
             gb = f["size"] / 2**30
             if gb <= usable:
-                if best is None or gb > best["size"] / 2**30:
-                    best = {"name": f["name"], "size": f["size"]}
+                best = {"name": f["name"], "size": f["size"]}
         rows.append({
             "id": repo,
             "fits_gpu": best is not None,
             "best_file": best["name"] if best else None,
             "best_size_gb": round(best["size"] / 2**30, 2) if best else None,
-            "file_count": len(files),
+            "min_size_gb": round(gguf[0]["size"] / 2**30, 2),
+            "file_count": len(gguf),
         })
     rows = [r for r in rows if r["fits_gpu"]]
-    rows.sort(key=lambda x: -x["best_size_gb"])
+    rows.sort(key=lambda x: -(x["best_size_gb"] or 0))
     return rows[:limit]
 
 
-def search_fit_vram(q, vram_mb, limit=40, token=None, ctx_estimate_mb=4):
-    """Search repos whose smallest GGUF resolves in GPU VRAM (strict full-offload)."""
-    usable = max(0.0, vram_mb - ctx_estimate_mb) / 2**30
+def search_fit_vram(q, vram_mb, limit=40, token=None, reserve_mb=400):
+    """Search repos whose smallest GGUF resolves in GPU VRAM (strict full-offload).
+    Every returned model must fully (weights) fit into the active GPU's free VRAM."""
+    usable = max(0.0, vram_mb - reserve_mb) / 1024.0  # MB -> GiB
     rows = search(q, limit=limit, token=token)
     out = []
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         futs = {ex.submit(repo_tree, row["id"], token): row for row in rows}
         for fut in futs:
             row = futs[fut]
@@ -150,10 +164,14 @@ def search_fit_vram(q, vram_mb, limit=40, token=None, ctx_estimate_mb=4):
                 continue
             gguf.sort(key=lambda x: x["size"])
             fits = gguf[0]["size"] / 2**30 <= usable
+            best = [f for f in gguf if f["size"] / 2**30 <= usable]
             out.append({**row, "fits": fits,
                         "files": gguf[:6],
+                        "best_file": best[-1]["name"] if best else None,
                         "min_gb": round(gguf[0]["size"] / 2**30, 2)})
-    return out
+    out = [r for r in out if r["fits"]]
+    out.sort(key=lambda x: x.get("downloads", 0), reverse=True)
+    return out[:limit]
 
 
 def detail(repo_id, token=None):
@@ -188,6 +206,17 @@ def local_models():
                 out.append({"repo": repo.replace("__", "/"), "file": fn, "path": p,
                             "size_gb": round(os.path.getsize(p) / 2**30, 2)})
     return out
+
+
+def strict_search_home(vram_mb, q=None, token=None, limit=20):
+    """Home hub: auto-populated compatible list + optional strict search."""
+    cur = compatible(vram_mb, limit=limit, token=token)
+    if q:
+        srch = search_fit_vram(q, vram_mb, limit=limit, token=token)
+        seen = {r["id"] for r in cur}
+        srch = [r for r in srch if r["id"] not in seen]
+        cur = cur + srch
+    return cur
 
 
 def _resolve(repo, filename, token=None):

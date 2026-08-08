@@ -81,7 +81,27 @@ class Engine:
         return self.proc is not None and self.proc.poll() is None
 
     def base_url(self):
-        return f"http://127.0.0.1:{self.port}"
+        if self.port:
+            return f"http://127.0.0.1:{self.port}"
+        url = os.environ.get("LLAMA_BASE_URL")
+        return url or f"http://127.0.0.1:{self.port or free_port()}"
+
+    def connect(self):
+        """Details external tools (opencode, claude-code, Cline/Roo, etc.) need."""
+        base = self.base_url()
+        return {
+            "base_url": base,
+            "api_url": f"{base}/v1/chat/completions",
+            "models_url": f"{base}/v1/models",
+            "health_url": f"{base}/health",
+            "api_style": "OpenAI-compatible",
+            "headers": {"Content-Type": "application/json",
+                        "Authorization": "Bearer local"},
+            "curl": f"curl -X POST {base}/v1/chat/completions -H 'Content-Type: application/json' "
+                    f"-d '{{\"model\":\"local\",\"messages\":{{\"role\":\"user\",\"content\":\"ping\"}}}}'",
+            "opencode": {"provider": "openai", "base_url": f"{base}/v1"},
+            "claude_code": {"base_url": f"{base}/v1", "model": "local"},
+        }
 
     def _tail(self, line):
         self.logs.append(line)
@@ -196,12 +216,25 @@ class Engine:
         return self.status()
 
     def _record_allocation(self):
-        from .metrics import total_vram
+        from .metrics import gpu_pid_memory, total_vram
+        used = 0
         try:
-            _, used_now = total_vram()
-            self.info["vram_allocated_mb"] = max(0, used_now - (self.baseline_vram or used_now))
-        except Exception as e:
-            self.info["vram_allocated_mb"] = 0
+            if self.proc:
+                gmap = gpu_pid_memory()
+                pid = self.proc.pid
+                kids = {c.pid for c in self.proc.children(recursive=True)}
+                used = sum(int(v) for k, v in gmap.items()
+                           if (k == pid or k in kids) and str(v).isdigit())
+        except Exception:
+            used = 0
+        if not used:
+            try:
+                _, free_now = total_vram()
+                used = max(0, (self.baseline_vram or 0) - free_now)
+            except Exception:
+                used = 0
+        self.info["vram_used_mib"] = used
+        self.info["vram_allocated_mb"] = used
 
     def stop(self):
         if self.proc is not None:
@@ -306,6 +339,7 @@ class Engine:
         })
         info.update(self.live())
         info.update(self._vram_split())
+        info["connect"] = self.connect()
         return info
 
     def _vram_split(self):
@@ -349,6 +383,13 @@ class EngineManager:
         self._cleanup_orphans()
 
     def _cleanup_orphans(self):
+        # Kill registered orphan pids AND any llama-server still alive,
+        # so restarting the manager starts with fully clean RAM/GPU.
+        try:
+            from .metrics import kill_llama_processes
+            kill_llama_processes()
+        except Exception:
+            pass
         for port, pid in read_pids().items():
             try:
                 p = psutil.Process(pid)

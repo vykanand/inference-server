@@ -4,9 +4,10 @@ import re
 import time
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import defaults, hub, metrics, settings
@@ -39,7 +40,22 @@ def hw():
 
 @app.get("/api/spec")
 def spec():
-    return defaults.param_spec()
+    spec_out = []
+    for s in defaults.param_spec():
+        d = dict(s)
+        cat = s.get("cat", "performance")
+        d["cat_label"] = defaults.CAT_LABEL.get(cat, "Performance")
+        d["cat_color"] = defaults.CAT_COLOR.get(cat, "green")
+        spec_out.append(d)
+    return spec_out
+
+
+@app.get("/api/autotune")
+def auto_tune():
+    """Returns recommended params for the ACTIVE GPU right now."""
+    hw = metrics.hardware()
+    gpu = hw.get("active_gpu")
+    return {"params": defaults.auto_tune(hw, 0, None), "gpu": gpu, "ram": hw.get("ram")}
 
 
 @app.get("/api/settings")
@@ -64,7 +80,20 @@ def or_free():
 @app.get("/api/search")
 def search(q: str = Query("instruct", min_length=1), limit: int = 40):
     s = settings.load()
-    return hub.search(q, limit, s.get("hf_token"))
+    return hub.search_fit_vram(q, _free_vram(), limit, s.get("hf_token"))
+
+
+@app.get("/api/hub")
+def hub_home():
+    """Auto-populated hub: only models that FULLY fit the active GPU."""
+    s = settings.load()
+    try:
+        rows = hub.compatible(_free_vram(), limit=30, token=s.get("hf_token"))
+        return {"models": rows, "gpu": metrics.active_gpu(), "vram_free_mb": _free_vram(),
+                "backend": metrics._backend()}
+    except Exception as e:
+        return {"models": [], "gpu": metrics.active_gpu(), "vram_free_mb": _free_vram(),
+                "backend": metrics._backend(), "error": str(e)}
 
 
 @app.get("/api/model/{repo:path}")
@@ -115,17 +144,24 @@ def auto_estimate(path):
     size_mb = os.path.getsize(path) / 2**20
     layers = meta.get("block_count") or 0
     _, free_vram = metrics.total_vram()
-    reserve = 400
+    reserve = 300
     usable = max(0, free_vram - reserve)
-    emb_out = min(900, size_mb * 0.35)
-    per_layer = max(20, (size_mb - emb_out) / max(layers, 1))
+    tunekv = defaults.auto_tune(metrics.hardware(), size_mb, layers or None,
+                                ctx_limit=meta.get("context_length") or None)
     fits = size_mb <= usable
-    ngl = layers if fits else int((usable - 0) / per_layer)
-    ngl = max(0, min(ngl, layers + (layers or 2)))
-    est_vram = size_mb if fits else per_layer * ngl + emb_out * min(1, ngl / max(layers, 1))
+    ngl = tunekv.get("n_gpu_layers", layers if fits else 999)
+    ngl = max(0, min(ngl, (layers or 999)))
+    per_layer = max(20, (size_mb - min(900, size_mb * 0.35)) / max(layers, 1))
+    est_vram = size_mb if fits else per_layer * ngl + min(900, size_mb * 0.35) * min(1, ngl / max(layers, 1))
     return {"layers": layers, "size_mb": round(size_mb, 1), "size_gb": round(size_mb / 1024, 2),
-            "fits_fully": fits, "suggested_ngl": ngl, "est_vram_mb": round(est_vram, 0),
+            "fits_fully": fits, "suggested_ngl": ngl,
+            "tuned": tunekv,
+            "est_vram_mb": round(min(est_vram + 128, free_vram), 0),
             "free_vram_mb": free_vram, "ctx_vram_est_mb": 128}
+
+def _free_vram():
+    _, free = metrics.total_vram()
+    return free
 
 
 @app.get("/api/engines")
@@ -138,12 +174,21 @@ def load(body: dict):
     path = body.get("path")
     if not path or not os.path.isfile(path):
         raise HTTPException(400, "model file not found")
-    params = {**defaults.default_params(), **body.get("params", {})}
+    set_params = dict(body.get("params", {}))
+    if body.get("auto_tune", True):
+        meta = read_gguf_meta(path)
+        layers = meta.get("block_count")
+        size_mb = os.path.getsize(path) / 2**20
+        tuned = defaults.auto_tune(metrics.hardware(), size_mb, layers or None,
+                                   ctx_limit=meta.get("context_length") or None)
+        params = {**defaults.default_params(), **tuned, **{k: v for k, v in set_params.items() if k not in tuned}}
+    else:
+        params = {**defaults.default_params(), **set_params}
     name = body.get("name") or os.path.basename(path)
     meta = read_gguf_meta(path)
     layers = meta.get("block_count") or params.get("n_gpu_layers")
     if params.get("n_gpu_layers") and params["n_gpu_layers"] > layers:
-        params["n_gpu_layers"] = layers
+        params["n_gpu_layers"] = layers if layers else params["n_gpu_layers"]
     eng = manager.load(path, params, name)
     eng.info.setdefault("layers_total", layers)
     out = eng.status()
@@ -236,6 +281,21 @@ def _stream_llama(port, payload):
     yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
 
 
+@app.post("/api/cleanup")
+def cleanup():
+    """Stop all engines + kill leftover llama-server processes: frees RAM + GPU."""
+    stopped = []
+    for e in list(manager.engines.values()):
+        nm = e.model_name
+        e.stop()
+        stopped.append(nm)
+    freed = metrics.kill_llama_processes()
+    _, free = metrics.total_vram()
+    return {"ok": True, "stopped": stopped, "killed_pids": [f["pid"] for f in freed],
+            "ram_freed_mb": round(sum(f["ram_mb"] for f in freed), 1),
+            "gpu_free_mb": free, "hardware": metrics.hardware()}
+
+
 @app.post("/api/engines/{port}/chat")
 def chat(port: int, body: dict):
     eng = manager.get(port)
@@ -245,13 +305,150 @@ def chat(port: int, body: dict):
     if not messages:
         raise HTTPException(400, "messages required")
     payload = {"messages": messages, "stream": True, "max_tokens": body.get("max_tokens", 512)}
-    for k in ("temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty", "frequency_penalty", "stop"):
+    for k in ("temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty",
+              "frequency_penalty", "stop", "tools", "tool_choice", "parallel_tool_calls"):
         if body.get(k) is not None:
             payload[k] = body[k]
     if body.get("cache_prompt") is True:
         payload["cache_prompt"] = True
     return StreamingResponse(_stream_llama(port, payload), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible API surface for opencode / GitHub Copilot / Cline / Roo.
+# No auth headers required: just point base_url at this server.
+# ---------------------------------------------------------------------------
+
+def _default_model_path():
+    """Pick a .gguf to auto-load when nothing is running (zero-config)."""
+    import glob
+    preferred = os.environ.get("DEFAULT_MODEL", "")
+    roots = [os.path.join(BASE, "models")]
+    found = []
+    for root in roots:
+        for f in glob.glob(os.path.join(root, "**", "*.gguf"), recursive=True):
+            found.append(f)
+    if not found:
+        return None
+    if preferred:
+        for f in found:
+            if preferred.lower() in f.lower():
+                return f
+    for f in found:
+        low = f.lower()
+        if "coder" in low or "instruct" in low:
+            return f
+    return sorted(found, key=os.path.getsize)[0]
+
+
+def _pick_engine(model):
+    with manager._lock:
+        running = [e for e in manager.engines.values() if e.running]
+    if not running:
+        return None
+    m = str(model or "")
+    for e in running:
+        if m and (e.model_name == m or str(e.port) == m or m in e.model_name):
+            return e
+    return running[0]
+
+
+def _ensure_engine(model_req):
+    """Return a running engine, auto-loading a default model if needed."""
+    eng = _pick_engine(model_req)
+    if eng and eng.running:
+        return eng
+    path = _default_model_path()
+    if not path:
+        return None
+    meta = read_gguf_meta(path)
+    layers = meta.get("block_count")
+    size_mb = os.path.getsize(path) / 2 ** 20
+    tuned = defaults.auto_tune(metrics.hardware(), size_mb, layers or None,
+                               ctx_limit=meta.get("context_length") or None)
+    params = {**defaults.default_params(), **tuned}
+    return manager.load(path, params, os.path.basename(path))
+
+
+def _proxy_completion(target, payload, model_req):
+    try:
+        r = requests.post(target, json=payload, timeout=600)
+    except Exception as e:
+        return 502, {"error": {"message": str(e)}}
+    try:
+        obj = r.json()
+    except Exception:
+        return r.status_code, {"error": {"message": r.text[:500]}}
+    if isinstance(obj, dict) and obj.get("model"):
+        obj["model"] = model_req
+    return r.status_code, obj
+
+
+@app.get("/v1/models")
+def v1_models():
+    data = []
+    for e in manager.list():
+        if e.get("running"):
+            data.append({"id": e.get("model_name") or "local", "object": "model",
+                         "created": 0, "owned_by": "local", "port": e.get("port")})
+    if not data:
+        data.append({"id": "local", "object": "model", "created": 0, "owned_by": "local"})
+    return {"object": "list", "data": data}
+
+
+@app.post("/v1/chat/completions")
+@app.post("/chat/completions")
+async def v1_chat_completions(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    model_req = body.get("model") or "local"
+    eng = await run_in_threadpool(_ensure_engine, model_req)
+    if not eng or not eng.running:
+        return JSONResponse(status_code=503, content={
+            "error": {"message": "No local model is loaded and no .gguf model found to auto-load. "
+                                 "Load a model via the UI (/api/engines/load) or set DEFAULT_MODEL.",
+                      "type": "no_model_loaded"}})
+    target = f"http://127.0.0.1:{eng.port}/v1/chat/completions"
+    payload = dict(body)
+    want_stream = bool(payload.get("stream", False))
+
+    def _stream_gen():
+        try:
+            with requests.post(target, json=payload, stream=True, timeout=600) as r:
+                if r.status_code != 200:
+                    yield 'data: {"error":"llama-server %s: %s"}\n\n' % (r.status_code, r.text[:200])
+                    return
+                for raw in r.iter_lines(decode_unicode=True):
+                    if not raw:
+                        continue
+                    if raw.startswith("data:"):
+                        d = raw[5:].strip()
+                        if d == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            continue
+                        try:
+                            obj = json.loads(d)
+                            if isinstance(obj, dict) and obj.get("model"):
+                                obj["model"] = model_req
+                            yield "data: " + json.dumps(obj) + "\n\n"
+                        except Exception:
+                            yield raw + "\n\n"
+                    else:
+                        yield raw + "\n\n"
+        except Exception as e:
+            yield 'data: {"error":"%s"}\n\n' % e
+
+    if want_stream:
+        return StreamingResponse(_stream_gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    status, obj = await run_in_threadpool(_proxy_completion, target, payload, model_req)
+    return JSONResponse(status_code=status, content=obj)
 
 
 @app.post("/api/config-chat")
@@ -332,12 +529,257 @@ def apply_config(body: dict):
     return {"ok": True, "status": st}
 
 
+@app.post("/api/engines/{port}/benchmark")
+def benchmark(port: int, body: dict):
+    """Real-time benchmark against the running engine (tokens/sec, TTFT)."""
+    eng = manager.get(port)
+    if not eng or not eng.running:
+        raise HTTPException(400, "no running engine")
+    runs = max(1, min(int(body.get("runs", 3)), 10))
+    prompt = body.get("prompt") or "Write a short Python function that computes the first 20 Fibonacci numbers. Output only code."
+    max_tokens = int(body.get("max_tokens", 200))
+    results = []
+    for i in range(runs):
+        payload = {"messages": [{"role": "user", "content": prompt}],
+                   "max_tokens": max_tokens, "temperature": 0, "stream": True}
+        t0 = time.time()
+        first = None
+        chars = 0
+        cpn = 0
+        try:
+            with requests.post(f"http://127.0.0.1:{port}/v1/chat/completions",
+                               json=payload, stream=True, timeout=300) as r:
+                if r.status_code != 200:
+                    results.append({"error": f"{r.status_code}"})
+                    continue
+                usage = None
+                for raw in r.iter_lines(decode_unicode=True):
+                    if not raw or not raw.startswith("data:"):
+                        continue
+                    d = raw[5:].strip()
+                    if d == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(d)
+                    except Exception:
+                        continue
+                    if first is None:
+                        first = time.time()
+                    choices = obj.get("choices") or []
+                    if choices:
+                        delta = (choices[0].get("delta") or {}).get("content")
+                        if delta:
+                            chars += len(delta)
+                    if obj.get("usage") and obj["usage"].get("completion_tokens"):
+                        cpn = obj["usage"].get("completion_tokens") or 0
+                elapsed = time.time() - t0
+                if cpn <= 0:
+                    cpn = max(1, int(chars / 4))
+                ttft = (first - t0) if first else elapsed
+                results.append({"run": i + 1, "tokens": cpn, "elapsed_s": round(elapsed, 3),
+                                "tps": round(cpn / elapsed, 2) if elapsed > 0 else 0,
+                                "ttft_s": round(ttft, 3),
+                                "prompt_tokens": (obj or {}).get("usage", {}).get("prompt_tokens")})
+        except Exception as e:
+            results.append({"run": i + 1, "error": str(e)})
+    ok = [r for r in results if r.get("tps")]
+    best = max(ok, key=lambda r: r["tps"]) if ok else None
+    avg = round(sum(r["tps"] for r in ok) / len(ok), 2) if ok else 0
+    return {"engine": eng.model_name, "port": port,
+            "params": {k: eng.params.get(k) for k in ("ctx", "n_gpu_layers", "flash_attn", "kv_type", "batch")},
+            "results": results, "best_tps": best["tps"] if best else 0,
+            "avg_tps": avg, "best_ttft_s": best["ttft_s"] if best else 0}
+
+
+def _tool_test_payload():
+    tools = [
+        {"type": "function", "function": {
+            "name": "get_weather", "description": "Get current weather for a city",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}},
+        {"type": "function", "function": {
+            "name": "search_web", "description": "Search the web for a query",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+        {"type": "function", "function": {
+            "name": "run_python", "description": "Execute python code and return output",
+            "parameters": {"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]}}},
+        {"type": "function", "function": {
+            "name": "read_file", "description": "Read contents of a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+    ]
+    return tools
+
+
+@app.post("/api/engines/{port}/tool-test")
+def tool_test(port: int, body: dict):
+    """Tests whether the loaded model emits valid tool_calls (multi-tool capable)."""
+    eng = manager.get(port)
+    if not eng or not eng.running:
+        raise HTTPException(404, "engine not running")
+    prompt = body.get("prompt") or "Use tools to answer: What is the weather in Berlin and Mumbai? Search the web for 'llama.cpp' and run Python to print hello."
+    max_tokens = int(body.get("max_tokens", 400))
+    payload = {"messages": [{"role": "user", "content": prompt}],
+               "tools": _tool_test_payload(), "parallel_tool_calls": True,
+               "max_tokens": max_tokens, "temperature": 0, "stream": True}
+    text = ""
+    first = None
+    t0 = time.time()
+    tool_calls = []
+    buffer = {}
+    errors = []
+    try:
+        with requests.post(f"http://127.0.0.1:{port}/v1/chat/completions",
+                           json=payload, stream=True, timeout=300) as r:
+            if r.status_code != 200:
+                return {"ok": False, "errors": [f"llama-server {r.status_code}: {r.text[:200]}"]}
+            for raw in r.iter_lines(decode_unicode=True):
+                if not raw or not raw.startswith("data:"):
+                    continue
+                ddat = raw[5:].strip()
+                if ddat == "[DONE]":
+                    continue
+                try:
+                    obj = json.loads(ddat)
+                except Exception:
+                    continue
+                if first is None:
+                    first = time.time()
+                ch = obj.get("choices") or []
+                if not ch:
+                    continue
+                delta = ch[0].get("delta") or {}
+                if delta.get("content"):
+                    text += delta["content"]
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    fn = tc.get("function") or {}
+                    buf = buffer.setdefault(idx, {"name": "", "args": ""})
+                    if fn.get("name"):
+                        buf["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        buf["args"] += fn["arguments"]
+    except Exception as e:
+        errors.append(str(e))
+    elapsed = time.time() - t0
+    calls = []
+    for idx in sorted(buffer):
+        b = buffer[idx]
+        args_json = b["args"]
+        valid_json = False
+        try:
+            import json as _j
+            parsed = _j.loads(args_json)
+            valid_json = isinstance(parsed, dict)
+        except Exception:
+            parsed = args_json
+        calls.append({"name": b["name"], "arguments_raw": args_json, "valid_json": valid_json,
+                      "arguments": parsed if valid_json else None})
+    score = 0
+    if calls:
+        score = sum(1 for c in calls if c["valid_json"] and c["name"])
+    has_tool = bool(calls)
+    finished = bool(calls) or (len(text.strip()) > 0)
+    return {"engine": eng.model_name, "port": port,
+            "tool_calls_made": len(calls), "calls": calls,
+            "supports_tools": has_tool,
+            "tool_score_pct": round(score / len(calls) * 100, 0) if calls else 0,
+            "text_fallback": text.strip()[:500] if not calls else None,
+            "elapsed_s": round(elapsed, 2), "errors": errors[:5]}
+
+
+@app.post("/api/engines/{port}/code-edit-test")
+def code_edit_test(port: int, body: dict):
+    """Runs a code-editing task through the local engine and scores the edit."""
+    eng = manager.get(port)
+    if not eng or not eng.running:
+        raise HTTPException(404, "engine not running")
+    code = body.get("code")
+    if not code:
+        code = (
+            "def sum_evens(numbers):\n"
+            "    total = 0\n"
+            "    for i, n in enumerate(numbers):\n"
+            "        if i % 2 == 0:\n"
+            "            total += n\n"
+            "    return total\n"
+        )
+    task = body.get("task") or "Fix the bug: this function sums elements at even indexes instead of even values. Return only corrected code."
+    sys_edit = ("You are a code editor. Make the requested edit, return ONLY the edited code in a code block, "
+                "no explanations.")
+    payload = {"messages": [{"role": "system", "content": sys_edit},
+                            {"role": "user", "content": f"{task}\n\n```python\n{code}\n```"}],
+               "max_tokens": int(body.get("max_tokens", 256)), "temperature": 0, "stream": True}
+    text = ""
+    first = None
+    t0 = time.time()
+    try:
+        with requests.post(f"http://127.0.0.1:{port}/v1/chat/completions",
+                           json=payload, stream=True, timeout=300) as r:
+            if r.status_code != 200:
+                return {"error": f"llama-server {r.status_code}: {r.text[:200]}"}
+            for raw in r.iter_lines(decode_unicode=True):
+                if not raw or not raw.startswith("data:"):
+                    continue
+                ddat = raw[5:].strip()
+                if ddat == "[DONE]":
+                    continue
+                try:
+                    obj = json.loads(ddat)
+                except Exception:
+                    continue
+                if first is None:
+                    first = time.time()
+                ch = obj.get("choices") or []
+                if ch:
+                    delta = ch[0].get("delta") or {}
+                    if delta.get("content"):
+                        text += delta["content"]
+    except Exception as e:
+        text += f"\n[error] {e}"
+    elapsed = time.time() - t0
+    tokens = max(1, int(len(text) / 4))
+    # collect all code blocks from edit
+    blocks = _extract_code_blocks(text)
+    edited = blocks[-1] if blocks else None
+    import ast
+    ast_ok = False
+    if edited:
+        try:
+            ast.parse(edited)
+            ast_ok = True
+        except SyntaxError:
+            ast_ok = False
+    return {"engine": eng.model_name, "port": port,
+            "output": text, "code_blocks": blocks, "last_block": edited,
+            "valid_python": ast_ok, "tokens": tokens,
+            "elapsed_s": round(elapsed, 2),
+            "tps": round(tokens / elapsed, 1) if elapsed > 0 else 0}
+
+
+def _extract_code_blocks(text):
+    blocks = []
+    for m in re.finditer(r"```(?:(\w+))?\s*\n(.*?)```", text, re.S):
+        if m.group(2).strip():
+            blocks.append(m.group(2).strip())
+    if not blocks:
+        cleaned = re.sub(r"^```\w*\s*|\s*```$", "", text.strip())
+        blocks = [cleaned] if cleaned else []
+    return blocks
+
+
 @app.get("/api/status")
 def status():
     return {"managers": manager.list(), "hardware": metrics.hardware(),
             "settings": {"openrouter_model": settings.load().get("openrouter_model"), "key_set": bool(settings.load().get("openrouter_key"))}}
 
 
+@app.post("/{path:path}")
+async def catch_all_chat(request: Request, path: str):
+    # Safety net: tolerate clients that append /chat/completions to the full URL.
+    if "chat/completions" in path:
+        return await v1_chat_completions(request)
+    raise HTTPException(404, "not found")
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", "8899")))
+    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", "8081")))

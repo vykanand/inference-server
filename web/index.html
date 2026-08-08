@@ -26,6 +26,9 @@
   <button class="tab" data-tab="test">Test Chat</button>
   <button class="tab" data-tab="config">Config Chat</button>
   <div class="tab-actions">
+    <button id="benchBtn" class="small" title="Run a live token/sec benchmark on the loaded model">⚡ Benchmark</button>
+    <button id="toolBtn" class="small" title="Test the loaded model's tool-calling ability">🛠 Tool Test</button>
+    <button id="cleanupBtn" class="small warn" title="Stop all engines and free GPU/RAM">🧹 Cleanup</button>
     <button id="loadBtn" class="primary small">+ Load Model</button>
     <button id="refreshBtn" class="small">Refresh</button>
     <button id="settingsBtn" class="small">Settings</button>
@@ -37,6 +40,38 @@
 <main>
   <!-- ============ MODELS TAB ============ -->
   <section id="tab-models" class="panel active">
+    <!-- -------- Utilities: benchmark / tool test / code edit, all in one place -------- -->
+    <div class="utils-grid">
+      <div class="util-card">
+        <div class="util-head">⚡ Benchmark <span class="muted">real-time token speed</span></div>
+        <p class="util-desc">Measures tokens/sec, time-to-first-token and latency on the loaded engine.</p>
+        <div>
+          <label>Runs</label>
+          <input type="number" id="benchRuns" value="3" min="1" max="10" style="width:80px">
+          <label style="display:inline;margin-left:8px">Max tokens</label>
+          <input type="number" id="benchTokens" value="200" min="32" step="16" style="width:90px">
+        </div>
+        <button id="benchRunBtn" class="small primary">Run benchmark</button>
+        <pre id="benchOut" class="util-out"></pre>
+      </div>
+      <div class="util-card">
+        <div class="util-head">🛠 Tool-Calling Test <span class="muted">multi-tool accuracy</span></div>
+        <p class="util-desc">Verifies the loaded model can emit valid JSON tool_calls (needed by opencode, Claude Code, Cline, Roo).</p>
+        <label>Prompt</label>
+        <textarea id="toolPrompt" rows="3">What is the weather in Berlin and Mumbai? Then search the web for "llama.cpp" and run a short python snippet that prints hello.</textarea>
+        <button id="toolRunBtn" class="small primary">Run tool test</button>
+        <pre id="toolOut" class="util-out"></pre>
+      </div>
+      <div class="util-card">
+        <div class="util-head">✏️ Code-Edit Test <span class="muted">edit accuracy</span></div>
+        <p class="util-desc">Runs a code-editing task and checks the returned code is valid Python.</p>
+        <label>Task</label>
+        <textarea id="codeTask" rows="2">Fix the bug: this function sums elements at even indexes instead of even values. Return only corrected code.</textarea>
+        <button id="codeRunBtn" class="small primary">Run code-edit test</button>
+        <pre id="codeOut" class="util-out"></pre>
+      </div>
+    </div>
+
     <div class="cols">
       <div class="col engines-col">
         <h3>Loaded Engines</h3>
@@ -45,9 +80,9 @@
         <div id="localList" class="card-list"></div>
       </div>
       <div class="col hub-col">
-        <h3>Model Hub <span class="muted">(HuggingFace · GGUF)</span></h3>
+        <h3>Model Hub <span class="muted" id="hubFitNote">(matching your GPU only)</span></h3>
         <div class="hub-search">
-          <input id="searchInput" placeholder="search models, e.g. qwen 3b instruct Q4">
+          <input id="searchInput" placeholder="search compatible GGUF models (fits VRAM only)">
           <button id="searchBtn" class="primary">Search</button>
         </div>
         <div id="dlList" class="card-list"></div>
@@ -64,6 +99,7 @@
         <select id="testModelSel"></select>
         <label>Max tokens</label>
         <input type="number" id="testMaxTokens" value="512" min="32" step="32">
+        <label class="chk"><input type="checkbox" id="useToolsChk" checked> Enable tool_calls (multi-tool test)</label>
         <h4>Sampling (per request)</h4>
         <div class="params" id="testParams"></div>
         <button id="clearChatBtn" class="small">Clear chat</button>
@@ -109,14 +145,17 @@
 
 <!-- ============ LOAD MODAL ============ -->
 <div id="modal" class="modal hidden">
-  <div class="modal-box">
-    <div class="modal-head"><h2>Load Model</h2><button id="modalClose" class="x">×</button></div>
+  <div class="modal-box load-box">
+    <div class="modal-head"><h2>Load Model — auto-tuned with live hardware</h2><button id="modalClose" class="x">×</button></div>
     <div class="modal-col">
       <div class="modal-left">
         <label>Model file</label>
         <select id="loadFileSel"></select>
         <a id="loadMeta" class="model-meta"></a>
-        <label>GPU offload</label>
+        <div class="fit-labels">
+          <label>GPU offload</label>
+          <button id="autoTuneBtn" class="small primary" title="Recompute parameters for the current GPU automatically">⚡ Auto-tune</button>
+        </div>
         <div class="slide-row">
           <input type="range" id="param-n_gpu_layers" min="0" max="999" step="1">
           <span id="nglVal" class="val"></span>
@@ -137,6 +176,13 @@
         </div>
         <button id="loadConfirm" class="primary block">Load & start server</button>
         <div id="loadStatus" class="load-status"></div>
+        <div class="cat-legend">
+          <div class="legend-title">Setting guide</div>
+          <div class="legend-item green"><span class="dot"></span>Performance / speed — big effect on tokens/sec</div>
+          <div class="legend-item blue"><span class="dot"></span>Accuracy — better tool calls &amp; reasoning</div>
+          <div class="legend-item purple"><span class="dot"></span>Context — prompt window size (weighs VRAM)</div>
+          <div class="legend-item amber"><span class="dot"></span>Memory — RAM / KV-cache trade-offs</div>
+        </div>
       </div>
     </div>
   </div>

@@ -24,8 +24,10 @@ def free_models(key=None):
 
 
 def build_system_prompt(status, spec, hardware):
-    hw = {"gpus": hardware.get("gpus"), "ram": hardware.get("ram"),
-          "cpu_count": hardware.get("cpu_count")}
+    hw = {"gpus": hardware.get("gpus"), "active_gpu": hardware.get("active_gpu"),
+          "ram": hardware.get("ram"), "cpu_count": hardware.get("cpu_count"),
+          "backend": hardware.get("backend")}
+    spec_json = json.dumps(spec or [])
     if status is None or not status.get("running"):
         obj = "No local model is currently running. Answer briefly with the JSON with empty changes, or advise on model choice."
     else:
@@ -47,10 +49,11 @@ CURRENT STATE: {obj}
 TUNABLE PARAMETERS SCHEMA: {spec_json}
 
 Rules:
-- One NVIDIA GPU with 4GB VRAM, ~15GB RAM.
+- Respect the ACTUAL free VRAM in HARDWARE. Never suggest params that need more VRAM than free.
 - Flash attention + kv_type q8_0 shrink KV-cache VRAM a lot. Higher ctx raises VRAM.
-- Speed lever: n_gpu_layers, batch, flash_attn, kv_type, threads.
+- Speed lever: n_gpu_layers (full offload first), batch, flash_attn, kv_type, threads.
 - Accuracy lever: kv f16, temp ~0.7, top_p ~0.9, repr 1.05-1.15. Lower min_p for quality.
+- Full offload (n_gpu_layers = total layers) is always the fastest when it fits.
 - Only propose values within schema min/max/step. Do not invent keys.
 
 Answer the user conversationally in at most 6 short sentences. Then on the FINAL line, output ONLY a JSON object matching EXACTLY:

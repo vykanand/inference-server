@@ -9,7 +9,7 @@ function esc(s) {
 }
 function mb(m) { return m >= 1024 ? (m / 1024).toFixed(1) + " GB" : Math.round(m) + " MB"; }
 
-let specs = [];
+let connectOpenState = new Map(); // Track open/closed state of connect boxes per engine port
 let engines = [];
 let localModels = [];
 let hardware = null;
@@ -67,6 +67,71 @@ function showModal(title, html) {
 $("#fileModalClose").onclick = () => $("#fileModal").classList.add("hidden");
 $("#fileModal").addEventListener("click", (e) => { if (e.target.id === "fileModal") $("#fileModal").classList.add("hidden"); });
 
+/* ---------------- UTILITIES (benchmark / tool test / code edit / cleanup) ---------------- */
+$("#cleanupBtn").onclick = async () => {
+  if (!confirm("Stop ALL engines and kill leftover llama-server processes? This frees GPU + RAM.")) return;
+  try {
+    const r = await api("/api/cleanup", { method: "POST", body: {} });
+    toast(`cleanup: stopped ${r.stopped.length} engine(s), GPU free ${mb(r.gpu_free_mb)}`);
+  } catch (e) { toast("cleanup failed: " + e.message, true); }
+  pollEngines();
+};
+$("#benchRunBtn").onclick = runBench;
+$("#toolRunBtn").onclick = runToolTest;
+$("#codeRunBtn").onclick = runCodeEditTest;
+$("#benchBtn").onclick = () => { switchTab("models"); $("#benchOut").scrollIntoView({ block: "center" }); };
+$("#toolBtn").onclick = () => { switchTab("models"); $("#toolOut").scrollIntoView({ block: "center" }); };
+
+async function runBench() {
+  const port = $("#testModelSel").value;
+  if (!port) return toast("load a model first", true);
+  const btn = $("#benchRunBtn"); btn.disabled = true;
+  $("#benchOut").textContent = "benchmarking…";
+  try {
+    const r = await api(`/api/engines/${port}/benchmark`, { method: "POST", body: {
+      runs: +$("#benchRuns").value || 3, max_tokens: +$("#benchTokens").value || 200,
+    }});
+    $("#benchOut").textContent = Object.entries(r.results || []).map(([, x]) =>
+      `run ${x.run}: ${x.tps ?? "-"} tok/s · TTFT ${x.ttft_s ?? "-"}s · ${x.tokens ?? "-"} tokens`).join("\n");
+
+    if (r.best_tps != null) $("#benchOut").textContent += `\n\nBEST: ${r.best_tps} tok/s  AVG: ${r.avg_tps} tok/s\nparams: ctx=${r.params?.ctx} ngl=${r.params?.n_gpu_layers} fa=${r.params?.flash_attn} kv=${r.params?.kv_type} batch=${r.params?.batch}`;
+  } catch (e) { $("#benchOut").textContent = "error: " + e.message; }
+  btn.disabled = false;
+}
+async function runToolTest() {
+  const port = $("#testModelSel").value;
+  if (!port) return toast("load a model first", true);
+  const btn = $("#toolRunBtn"); btn.disabled = true;
+  $("#toolOut").textContent = "testing tool calls…";
+  try {
+    const r = await api(`/api/engines/${port}/tool-test`, { method: "POST", body: { prompt: $("#toolPrompt").value.trim() } });
+    let s = `tool_calls_made: ${r.tool_calls_made ?? 0}\nsupports_tools: ${r.supports_tools ?? false}\ntool_score: ${r.tool_score_pct ?? 0}% ✅ valid JSON\nengine: ${r.engine ?? "-"}\n\n`;
+    for (const c of r.calls || []) {
+      s += `• ${c.name} → ${c.valid_json ? "valid JSON" : "BROKEN"}\n  ${(c.arguments_raw || "").slice(0, 220)}\n`;
+    }
+    if (r.text_fallback) s += `\n(fallback text — model may not support tools)\n${r.text_fallback}`;
+    if (r.errors && r.errors.length) s += `\nerrors: ${r.errors.join(" | ")}`;
+    if (r.elapsed_s != null) s += `\nelapsed: ${r.elapsed_s}s`;
+    $("#toolOut").textContent = s;
+    if (r.supports_tools === false) toast("model did not emit tool_calls — check chat template", true);
+  } catch (e) { $("#toolOut").textContent = "error: " + e.message; toast("tool test failed: " + e.message, true); }
+  btn.disabled = false;
+}
+async function runCodeEditTest() {
+  const port = $("#testModelSel").value;
+  if (!port) return toast("load a model first", true);
+  const btn = $("#codeRunBtn"); btn.disabled = true;
+  $("#codeOut").textContent = "running code-edit test…";
+  try {
+    const r = await api(`/api/engines/${port}/code-edit-test`, { method: "POST", body: { task: $("#codeTask").value.trim() } });
+    let s = r.error ? "error: " + r.error
+      : `valid_python: ${r.valid_python ? "✅ yes" : "❌ no (not parseable)"}\ntokens: ${r.tokens} · ${r.tps ?? 0} tok/s · ${r.elapsed_s ?? "-"}s\n\n`;
+    s += (r.last_block || r.output || "").slice(0, 900);
+    $("#codeOut").textContent = s;
+  } catch (e) { $("#codeOut").textContent = "error: " + e.message; toast("code-edit test failed: " + e.message, true); }
+  btn.disabled = false;
+}
+
 /* ---------------- POLLING ---------------- */
 setInterval(pollEngines, 2500);
 setInterval(pollHardware, 3000);
@@ -95,10 +160,11 @@ function renderHardware() {
   $("#vramText").textContent = total ? `${mb(used)} / ${mb(total)}` : "no GPU";
   $("#ramBar").style.width = (hardware?.ram?.used_pct || 0) + "%";
   $("#ramText").textContent = hardware?.ram ? `${hardware.ram.used_gb}/${hardware.ram.total_gb} GB` : "—";
-  const g = gpus.find((x) => x.name.toLowerCase().includes("nvidia")) || gpus[0];
-  $("#gpuUtil").textContent = g ? `${g.name.split(" ").slice(0, 2).join(" ")} · ${g.util_pct}% ${g.temp_c}°` : "no GPU";
+  const g = hardware?.active_gpu || gpus[0];
+  $("#gpuUtil").textContent = g ? `${g.name.split(" ").slice(0, 3).join(" ")} · ${mb(g.vram_free_mb)} free · ${g.util_pct}%` : "no GPU";
   const running = engines.filter((x) => x.running).length;
   $("#engineState").textContent = running ? `up (${running})` : "idle";
+  if (g) $("#hubFitNote").textContent = `(matching ${g.name.split(",")[0]} · ${mb(g.vram_free_mb)} free VRAM)`;
 }
 
 /* ---------------- ENGINES ---------------- */
@@ -116,6 +182,7 @@ function engCard(e) {
   const tps = e.metrics?.predicted_speed ? e.metrics.predicted_speed.toFixed(1) : "—";
   const fit = e.gpu_fit_pct != null ? Math.round(e.gpu_fit_pct) + "%" : "?";
   const vramTxt = e.vram_used_engine_mb ? ` ≈${mb(e.vram_used_engine_mb)} live` : "";
+  const c = e.connect || {};
   return `<div class="card">
     <div class="d">PORT <b>${e.port}</b> <span class="status-dot ${dot}"></span> ${e.ready ? "ready" : (e.running ? "loading" : "stopped")}${e.pid ? " · pid " + e.pid : ""}</div>
     <div class="t">${esc(e.model_name)}</div>
@@ -124,7 +191,7 @@ function engCard(e) {
       <span class="stat-chip">model ${mb(e.model_size_mb)}</span>
     </div>
     <div class="row">
-      <span class="stat-chip">VRAM ≈ ${mb(e.est_vram_mb)}${e.vram_used_engine_mb ? ` · measured ${mb(e.vram_used_engine_mb)}` : ""}</span>
+      <span class="stat-chip">VRAM ≈ ${mb(e.est_vram_mb)}${vramTxt}</span>
       <span class="stat-chip">GPU ${mb(e.gpu_weights_mb)} / RAM ${mb(e.ram_weights_mb)} w</span>
     </div>
     <div class="row">
@@ -133,12 +200,47 @@ function engCard(e) {
       <span class="stat-chip">KV ${p.kv_type ?? "f16"}${p.flash_attn ? "+fa" : ""}</span>
       <span class="stat-chip">RAM ${e.ram_used_engine_mb ? Math.round(e.ram_used_engine_mb) + " MB" : "—"}</span>
     </div>
+    <div class="connect-box ${e.ready ? "ready" : ""}">
+      <div class="connect-head" onclick="toggleConnect(this.parentElement)">
+        <span class="connect-title">${e.ready ? "● Ready — click to view API connection details" : "Connecting info"}</span>
+        <span class="connect-caret">▾</span>
+      </div>
+      <div class="connect-body">
+        <div class="muted">OpenAI-compatible endpoint — use from opencode, Claude Code, Cline, Roo, VS Code AI plugins.</div>
+        <div class="kv"><label>Base URL</label><code id="cu-$base-${e.port}">${esc(c?.api_url || e.base_url)}</code><button class="small" onclick="copyText('cu-$base-${e.port}')">Copy</button></div>
+        <div class="kv"><label>Models</label><code>${esc(c?.models_url || e.base_url + "/v1/models")}</code></div>
+        <div class="kv"><label>Health</label><code>${esc(c?.health_url || e.base_url + "/health")}</code></div>
+        <div class="kv"><label>Headers</label><code>Content-Type: application/json  ·  Authorization: Bearer local</code></div>
+        <div class="kv full">
+          <label>OpenCode / Claude Code provider</label>
+          <pre>// ~/.opencode/opencode.json  or  CLAUDE_CODE provider
+{
+  "provider": "opencode-local",
+  "base_url": "${esc(c?.base_url || e.base_url)}/v1",
+  "api_key": "local"
+}</pre>
+        </div>
+        <div class="kv full">
+          <label>Cline / Roo</label>
+          <pre>Settings → API Provider: OpenAI Compatible
+API Base URL: ${esc(c?.base_url || e.base_url)}/v1
+API Key: any value (e.g. "local")</pre>
+        </div>
+        <div class="kv"><label>curl</label><code>curl ${esc(c?.api_url || e.base_url + "/v1/chat/completions")} -H "Content-Type: application/json" -d '{"model":"local","messages":[{"role":"user","content":"hello"}]}'</code></div>
+      </div>
+    </div>
     <div class="btn-row" style="margin-top:8px">
       <button class="small primary" onclick="testModel(${e.port})">Test</button>
       <button class="small" onclick="editEngine(${e.port})">Edit</button>
       <button class="small" onclick="showLogs(${e.port})">Logs</button>
-      <button class="small" onclick="stopEngine(${e.port})">Stop</button>
+      <button class="small warn" onclick="stopEngine(${e.port})">Stop</button>
     </div></div>`;
+}
+function toggleConnect(el) { if (el) el.classList.toggle("open"); }
+window.toggleConnect = toggleConnect;
+function copyText(id) {
+  const el = document.getElementById(id);
+  if (navigator.clipboard && el) navigator.clipboard.writeText(el.textContent).then(() => toast("copied"));
 }
 function fitLabel(e) {
   const o = e.layers_offloaded, t = e.layers_total;
@@ -168,7 +270,10 @@ async function showLogs(port) {
   const r = await api(`/api/engines/${port}/logs?n=160`);
   showModal("llama-server logs", `<pre style="max-height:60vh;overflow:auto;margin:0">${esc((r.logs || []).join("\n"))}</pre>`);
 }
-function stopEngine(port) { api(`/api/engines/${port}/stop`, { method: "POST", body: {} }).then(pollEngines); }
+function stopEngine(port) {
+  if (!confirm(`Stop engine on port ${port}?`)) return;
+  api(`/api/engines/${port}/stop`, { method: "POST", body: {} }).then(pollEngines);
+}
 
 /* ---------------- LOCAL MODELS ---------------- */
 async function refreshLocal() {
@@ -186,28 +291,52 @@ function renderLocal() {
 }
 function openLoadByPath(p) { $("#loadFileSel").value = p; openLoadModalFor(null); }
 
-/* ---------------- HUB ---------------- */
+/* ---------------- HUB (VRAM-filtered) ---------------- */
 $("#searchBtn").onclick = searchNow;
 $("#searchInput").onkeydown = (e) => { if (e.key === "Enter") searchNow(); };
+async function loadHub() {
+  try {
+    const r = await api("/api/hub");
+    renderHub(r.models || [], "Compatible with your GPU — fully offloadable:");
+    if (r.gpu) $("#hubFitNote").textContent = `(matching ${r.gpu.name.split(",")[0]} · ${mb(r.vram_free_mb)} free VRAM)`;
+  } catch (e) { $("#hubResults").innerHTML = '<div class="muted">hub unavailable</div>'; }
+}
+function renderHub(rows, label) {
+  $("#hubResults").innerHTML = rows.length
+    ? `<div class="muted" style="margin-bottom:6px">${esc(label)}</div>` + rows.map((m) => `
+      <div class="card">
+        <div class="t">${esc(m.id)}</div>
+        <div class="d">fits VRAM: <b class="gpu-full">✅ ${m.best_size_gb ?? "?"} GB</b> · files ${m.file_count ?? "?"}
+          ${m.downloads != null ? ` · dl ${m.downloads}` : ""}</div>
+        <div class="btn-row" style="margin-top:6px">
+          <button class="small primary" onclick="inspectRepoDownload('${esc(m.id)}')">Files</button>
+        </div>
+      </div>`).join("")
+    : '<div class="muted">No models on HuggingFace fit your current GPU VRAM. Lower VRAM usage or clear GPU with ⚡ Cleanup.</div>';
+}
 async function searchNow() {
   const q = $("#searchInput").value.trim() || "instruct";
   try {
     const rows = await api(`/api/search?q=${encodeURIComponent(q)}&limit=40`);
-    $("#hubResults").innerHTML = rows.map((m) => `
-      <div class="card"><div class="t">${esc(m.id)}</div>
-      <div class="d">downloads ${m.downloads} · likes ${m.likes}${m.pipeline_tag ? " · " + m.pipeline_tag : ""}</div>
-      <button class="small" onclick="inspectRepo('${esc(m.id)}')">Files</button></div>`).join("");
+    renderHub(rows, q + " — only models fitting VRAM");
+    if (!rows.length) toast("No search results fit your GPU — try a smaller quant", true);
   } catch (e) { toast(e.message, true); }
 }
-async function inspectRepo(repo) {
+
+async function inspectRepoDownload(repo) {
   try {
     const d = await api("/api/model/" + encodeURIComponent(repo));
-    const files = d.files || [];
+    const files = (d.files || []).filter((f) => f.size > 0);
     if (!files.length) return toast("no GGUF files in repo", true);
-    showModal("Download · " + repo, files.map((f) => `
-      <div class="card"><div class="t">${esc(f.name)}</div>
-      <div class="d">${f.size ? (f.size / 2 ** 30).toFixed(2) + " GB" : ""}</div>
-      <button class="small primary" onclick="downloadModel('${esc(repo)}','${esc(f.name)}')">Download</button></div>`).join(""));
+    const freeVram = hardware?.active_gpu?.vram_free_mb ?? 0;
+    const maxBytes = Math.max(0, freeVram * 1024 * 1024 - 400 * 1024 * 1024);
+    const list = files.map((f) => {
+      const fits = f.size <= maxBytes;
+      return `<div class="card"><div class="t">${esc(f.name)}</div>
+        <div class="d">${(f.size / 2 ** 30).toFixed(2)} GB · <span class="${fits ? "m-fit" : "m-nofit"}">${fits ? "✅ fits GPU" : "⚠ exceeds VRAM"}</span></div>
+        <button class="small primary" ${fits ? "" : "disabled"} onclick="downloadModel('${esc(repo)}','${esc(f.name)}')">${fits ? "Download" : "Too big"}</button></div>`;
+    }).join("");
+    showModal("Download · " + repo, list);
   } catch (e) { toast(e.message, true); }
 }
 async function downloadModel(repo, file) {
@@ -230,7 +359,16 @@ function gb2(b) { return (b / 2 ** 30).toFixed(2); }
 $("#loadBtn").onclick = () => openLoadModalFor(null);
 $("#modalClose").onclick = () => $("#modal").classList.add("hidden");
 $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") $("#modal").classList.add("hidden"); });
-$("#fitFullBtn").onclick = () => { mparams.n_gpu_layers = 999; renderModalParams(); };
+$("#autoTuneBtn").onclick = async () => {
+  const path = $("#loadFileSel").value;
+  if (!path) return toast("select a model file first", true);
+  try {
+    const est = await api("/api/estimate?path=" + encodeURIComponent(path));
+    applyTune(est.tuned || {});
+    toast("auto-tuned for current hardware");
+  } catch (e) { toast("auto-tune failed: " + e.message, true); }
+};
+$("#fitFullBtn").onclick = () => { mparams.n_gpu_layers = specs.find((s) => s.key === "n_gpu_layers")?.max ?? 999; renderModalParams(); };
 $("#fitRamBtn").onclick = () => {
   const p = $("#loadFileSel").value;
   if (!p) return;
@@ -246,11 +384,19 @@ $("#param-n_gpu_layers").addEventListener("input", () => {
 $("#loadFileSel").addEventListener("change", (e) => updateFileInfo(e.target.value));
 $("#loadConfirm").onclick = doLoad;
 
+function applyTune(tuned) {
+  Object.assign(mparams, tuned || {});
+  specs.forEach((s) => { if (mparams[s.key] == null) mparams[s.key] = s.default; });
+  renderModalParams();
+}
+
 function openLoadModalFor(port = null) {
   const eng = port ? engines.find((e) => e.port === port) : null;
   mport = port;
   specs.forEach((s) => { mparams[s.key] = eng ? (eng.params[s.key] ?? s.default) : s.default; });
-  $("#loadFileSel").value = eng ? eng.model_path : $("#loadFileSel").value;
+  if (eng && eng.model_path) {
+    $("#loadFileSel").value = eng.model_path;
+  }
   $("#loadConfirm").textContent = port ? "Save & restart" : "Load & start server";
   renderModalParams();
   updateFileInfo($("#loadFileSel").value);
@@ -264,13 +410,16 @@ function renderModalParams() {
   const box = $("#paramList");
   box.innerHTML = specs.filter((s) => s.key !== "n_gpu_layers").map((s) => {
     const v = mparams[s.key];
+    const ccat = s.cat_color || "green";
+    const tag = `<span class="cat-tag ${ccat}">${esc(s.cat_label || "")}</span>`;
     if (s.type === "bool")
-      return `<div class="param-row"><div class="param-head"><span>${esc(s.label)}</span></div>
+      return `<div class="param-row"><div class="param-head"><span>${esc(s.label)}</span>${tag}</div>
         <label class="chk"><input type="checkbox" ${v ? "checked" : ""} onchange="setBool('${s.key}',this.checked)">${esc(s.help)}</label></div>`;
     if (s.type === "enum")
-      return `<div class="param-row"><div class="param-head"><span>${esc(s.label)}</span></div>
+      return `<div class="param-row"><div class="param-head"><span>${esc(s.label)}</span>${tag}</div>
         <select onchange="setVal('${s.key}',this.value)">${s.options.map((o) => `<option ${o === v ? "selected" : ""}>${o}</option>`).join("")}</select></div>`;
     return `<div class="param-row"><div class="param-head"><span>${esc(s.label)}</span><span class="val" id="pv-${s.key}">${v}</span></div>
+      ${tag}
       <input type="range" id="pr-${s.key}" min="${s.min}" max="${s.max}" step="${s.step}" value="${v}" data-k="${s.key}">
       <div class="muted">${esc(s.help)}</div></div>`;
   }).join("");
@@ -300,11 +449,16 @@ async function updateFileInfo(path) {
     $("#stVram").textContent = mb(est.est_vram_mb);
     $("#stFree").textContent = mb(est.free_vram_mb) + " free";
     const hint = $("#fitHint");
-    if (est.fits_fully) { hint.textContent = "Fits fully on GPU — maximum speed"; hint.className = "fit-hint ok"; }
-    else { hint.textContent = "Does NOT fully fit — remainder runs from system RAM"; hint.className = "fit-hint warn"; }
-    if (mport == null) { mparams.n_gpu_layers = est.suggested_ngl; renderModalParams(); }
+    if (est.fits_fully) { hint.textContent = "✅ Fits fully on GPU — maximum speed (auto-tuned)"; hint.className = "fit-hint ok"; }
+    else { hint.textContent = "⚠ Does NOT fully fit — remainder runs from system RAM"; hint.className = "fit-hint warn"; }
+    if (mport == null && !autoApplied) {
+      autoApplied = true;
+      if (est.tuned) { Object.assign(mparams, est.tuned); renderModalParams(); }
+      else mparams.n_gpu_layers = est.suggested_ngl;
+    }
   } catch (e) {}
 }
+let autoApplied = false;
 function updateEstVram() {
   const size = parseFloat(($("#stSize").textContent || "0"));
   const layers = parseInt($("#stLayers").textContent || "1", 10);
@@ -321,7 +475,7 @@ async function doLoad() {
     if (mport) {
       await api(`/api/engines/${mport}/restart`, { method: "POST", body: { params: mparams } });
     } else {
-      await api("/api/engines/load", { method: "POST", body: { path, params: mparams, name: path.split(/[\\/]/).pop() } });
+      await api("/api/engines/load", { method: "POST", body: { path, params: mparams, auto_tune: true, name: path.split(/[\\/]/).pop() } });
     }
     $("#modal").classList.add("hidden");
     toast(mport ? "engine restarted with new settings" : "model loaded");
@@ -394,6 +548,13 @@ async function readSSE(res, h) {
   }
 }
 
+const TEST_TOOLS = [
+  { type: "function", function: { name: "get_weather", description: "Get weather for a city", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } },
+  { type: "function", function: { name: "search_web", description: "Search the web", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+  { type: "function", function: { name: "run_python", description: "Run python", parameters: { type: "object", properties: { code: { type: "string" } }, required: ["code"] } } },
+  { type: "function", function: { name: "list_files", description: "List files in a directory", parameters: { type: "object", properties: { path: { type: "string" } } } } },
+];
+
 async function sendTest() {
   const port = $("#testModelSel").value;
   if (!port) return toast("load a model first", true);
@@ -408,6 +569,7 @@ async function sendTest() {
     const el = $("#slider-" + k);
     if (el) body[k] = parseFloat(el.value);
   }
+  if ($("#useToolsChk")?.checked) { body.tools = TEST_TOOLS; body.parallel_tool_calls = true; }
   testMsgs.push({ role: "user", content: input });
   addMsg("#testChat", "user", input);
   const as = addMsg("#testChat", "assistant", "");
@@ -416,8 +578,17 @@ async function sendTest() {
     const res = await fetch(`/api/engines/${port}/chat`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     await readSSE(res, {
       data(o) {
-        const c = o.choices?.[0]?.delta?.content;
+        const delta = o.choices?.[0]?.delta;
+        const c = delta?.content;
         if (c) { text += c; as.body.textContent = text; as.el.scrollIntoView({ block: "end" }); }
+        const tcs = delta?.tool_calls || [];
+        for (const tc of tcs) {
+          const fn = tc.function || {};
+          const line = `[tool_call] ${fn.name}(${fn.arguments || ""})`;
+          text += (text.endsWith("\n") ? "" : "\n") + line;
+          as.body.className = "msg-body tool-body";
+          as.body.textContent = text;
+        }
       },
       meta(m) {
         const d = document.createElement("div");
@@ -497,6 +668,7 @@ async function sendConfig() {
     renderTestParams();
     await refreshLocal();
     await initConfig();
+    await loadHub();
     pollEngines();
     pollHardware();
     renderModalParams();
