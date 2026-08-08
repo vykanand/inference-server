@@ -351,10 +351,6 @@ def chat(port: int, body: dict):
             messages = _augment_tool_system(messages, payload["tools"])
         messages, _, _ = truncate_messages(messages, budget)
         payload["messages"] = messages
-        if payload.get("tools"):
-            payload["temperature"] = 0.0
-            payload.pop("top_p", None)
-            payload.pop("top_k", None)
     if body.get("cache_prompt") is True:
         payload["cache_prompt"] = True
     return StreamingResponse(_stream_llama(port, payload), media_type="text/event-stream",
@@ -653,22 +649,16 @@ def _looks_like_tool_call(text):
 
 
 def _augment_tool_system(messages, tools):
-    """GGUFs without native tool templates (most local Qwen/Coder GGUFs)
-    won't emit OpenAI tool_calls. Prepend a short, forceful directive BEFORE
-    the existing system prompt so even small/weak models process it first.
-    
-    The tool format instruction is kept under 300 chars to survive aggressive
-    ctx truncation on small-GPU (e.g. 4 GB) systems."""
+    """Prepend a SHORT tool-format primer so non-native-tool GGUFs understand
+    they should emit fenced JSON. Uses encouraging (not restrictive) language
+    to prevent safety-refusal on small models (Phi-4, Qwen 1-3B)."""
     names = _tool_names(tools)[:20]
     tool_format = (
-        "IMPORTANT — You have EXACTLY these tools and NO others. "
-        "If asked something you cannot do, explain in plain text — never make up tool names.\n"
-        "Tools: " + ", ".join(names) + ".\n"
-        "To call a tool, output ONLY this exact format (no other words):\n"
+        "You can call tools using:\n"
         "```json\n"
-        "{\"name\":\"one_of_the_above\",\"arguments\":{...}}\n"
+        '{"name":"tool","arguments":{}}\n'
         "```\n"
-        "For everything else, answer in plain text. Do NOT invent tool names.\n\n"
+        "Available: " + ", ".join(names) + "\n\n"
     )
     msgs = list(messages)
     idx = None
@@ -679,7 +669,7 @@ def _augment_tool_system(messages, tools):
     if idx is not None:
         m = dict(msgs[idx])
         c = m.get("content") or ""
-        if "CALL TOOLS USING" not in c and "tool-calling agent" not in c:
+        if "You can call tools using" not in c and "TOOL USE FORMAT" not in c:
             m["content"] = tool_format + c
         msgs[idx] = m
     else:
@@ -854,17 +844,6 @@ async def v1_chat_completions(request: Request):
         if was_truncated and eng.ready:
             eng.info["_truncated"] = True
             eng.info["_freed_tokens"] = freed
-        # Force temp=0 when tools present: weak models (1-7B) hallucinate JSON
-        # with any stochastic sampling. Deterministic decode fixes tool calling.
-        if payload.get("tools"):
-            payload["temperature"] = 0.0
-            payload.pop("top_p", None)
-            payload.pop("top_k", None)
-        # Warn if system prompt is huge — common opencode cause of weak-model confusion
-        sysp_len = sum(len(str(m.get("content",""))) for m in payload["messages"] if m.get("role") == "system")
-        if sysp_len > 4000:
-            eng.info["_huge_sysprompt"] = True
-            eng.info["_sysprompt_chars"] = sysp_len
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
