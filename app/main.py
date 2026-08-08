@@ -839,8 +839,8 @@ def _normalize_messages(messages):
                     args = json.loads(fn.get("arguments") or "{}")
                 except Exception:
                     args = fn.get("arguments", {})
-                parts.append("```json\n" + json.dumps({"name": fn.get("name",""), "arguments": args},
-                                                        ensure_ascii=False) + "\n```")
+                # NO backtick fences — models see ```json in history and snowball
+                parts.append("Called %s(%s)" % (fn.get("name", ""), json.dumps(args, ensure_ascii=False)))
             out.append({"role": "assistant", "content": "\n".join(parts)})
         elif role == "tool":
             tcid = m.get("tool_call_id")
@@ -1063,7 +1063,8 @@ async def v1_chat_completions(request: Request):
                                 if isinstance(msgs, list) and len(msgs) > 2:
                                     sysmsg = [msgs[0]] if msgs and msgs[0].get("role") == "system" else []
                                     rest = msgs[1:] if sysmsg else msgs
-                                    keep = max(1, len(rest) // 2)
+                                    # Keep system + last 6 turns to stop context growth
+                                    keep = max(1, min(len(rest), 6))
                                     payload["messages"] = sysmsg + rest[-keep:]
                                     _log("truncate", kept=len(payload["messages"]), reason="ctx_400")
                                     continue
