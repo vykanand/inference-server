@@ -2,7 +2,7 @@ import os
 import subprocess
 import sys
 
-PORT = int(os.environ.get("PORT", "8899"))
+PORT = int(os.environ.get("PORT", "8081"))
 
 if __name__ == "__main__":
     import uvicorn

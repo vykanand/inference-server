@@ -342,6 +342,41 @@ def _default_model_path():
     return sorted(found, key=os.path.getsize)[0]
 
 
+def _escape_json(s):
+    """Escape a string so it is safe to embed inside JSON."""
+    return json.dumps(str(s))
+
+
+def truncate_messages(messages, ctx_limit):
+    """Drop oldest messages so total tokens fit within ctx_limit.
+    
+    Keeps system prompt + recent exchange pairs. Uses char/4 as rough token estimate.
+    """
+    if not messages or not isinstance(messages, list):
+        return messages, False, 0
+    # Estimate tokens per message
+    def _toks(m):
+        c = m.get("content") or ""
+        tc = len(c) // 4
+        for tc_item in m.get("tool_calls") or []:
+            args = tc_item.get("function", {}).get("arguments") or ""
+            tc += len(args) // 4
+        return max(tc, 1)
+    total_toks = sum(_toks(m) for m in messages)
+    if total_toks <= ctx_limit:
+        return messages, False, 0
+    # Keep first (system) + last N messages until under budget
+    kept = [messages[0]] if messages[0].get("role") == "system" else []
+    dropped = list(messages) if kept else list(messages)
+    freed = 0
+    while dropped and total_toks > ctx_limit:
+        old = dropped.pop(0)
+        freed += _toks(old)
+        total_toks -= _toks(old)
+    result = kept + dropped
+    return result, True, freed
+
+
 def _pick_engine(model):
     with manager._lock:
         running = [e for e in manager.engines.values() if e.running]
@@ -417,11 +452,22 @@ async def v1_chat_completions(request: Request):
     payload = dict(body)
     want_stream = bool(payload.get("stream", False))
 
+    # --- Context-aware message truncation (fixes "exceeds available context size") ---
+    ctx_limit = eng.params.get("ctx", 4096)
+    messages = payload.get("messages")
+    if isinstance(messages, list) and len(messages) > 1:
+        truncated, was_truncated, freed = truncate_messages(messages, ctx_limit)
+        payload["messages"] = truncated
+        if was_truncated and eng.ready:
+            eng.info["_truncated"] = True
+            eng.info["_freed_tokens"] = freed
+
     def _stream_gen():
         try:
             with requests.post(target, json=payload, stream=True, timeout=600) as r:
                 if r.status_code != 200:
-                    yield 'data: {"error":"llama-server %s: %s"}\n\n' % (r.status_code, r.text[:200])
+                    err_msg = json.dumps({"error": {"message": "llama-server %s: %s" % (r.status_code, r.text[:500])}})
+                    yield "data: " + err_msg + "\n\n"
                     return
                 for raw in r.iter_lines(decode_unicode=True):
                     if not raw:
@@ -437,11 +483,14 @@ async def v1_chat_completions(request: Request):
                                 obj["model"] = model_req
                             yield "data: " + json.dumps(obj) + "\n\n"
                         except Exception:
-                            yield raw + "\n\n"
+                            # Raw non-JSON line — wrap in valid SSE/JSON so client can parse
+                            safe = json.dumps({"error": {"message": str(raw)[:500]}})
+                            yield "data: " + safe + "\n\n"
                     else:
                         yield raw + "\n\n"
         except Exception as e:
-            yield 'data: {"error":"%s"}\n\n' % e
+            safe_err = json.dumps({"error": {"message": str(e)}})
+            yield "data: " + safe_err + "\n\n"
 
     if want_stream:
         return StreamingResponse(_stream_gen(), media_type="text/event-stream",
