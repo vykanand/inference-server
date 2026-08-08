@@ -88,7 +88,6 @@ def auto_tune(hw, file_size_mb, layers=None, ctx_limit=None):
 
     p = default_params()
     p["flash_attn"] = True
-    p["kv_type"] = "f16"
     p["cache_reuse"] = True
 
     # --- offload: fit the WHOLE model on GPU when possible, else max layers ---
@@ -107,9 +106,12 @@ def auto_tune(hw, file_size_mb, layers=None, ctx_limit=None):
         p["n_gpu_layers"] = 999
 
     # --- context: biggest window that still fits ---
+    # Use q8_0 KV cache by default — halves VRAM vs f16, doubling ctx budget.
+    # f16 is faster but agents need context more than they need KV cache speed.
+    p["kv_type"] = "q8_0"
     if layers:
-        # f16 KV ≈ 2 * n_layer * n_kv_head * head_dim * 2 bytes — ~0.11..0.4 MB/token
-        kv_mb_per_token = max(0.10, layers * 0.004)
+        # q8_0 KV ≈ n_layer * 0.002 MB per token
+        kv_mb_per_token = max(0.04, layers * 0.002)
         head = max(0, free_vram - file_size_mb - reserve)
         max_ctx = int(head / kv_mb_per_token) if head > 0 else 2048
     else:
