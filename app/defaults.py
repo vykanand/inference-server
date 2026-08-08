@@ -28,11 +28,11 @@ PARAM_SPEC = [
     {"key": "cache_reuse", "label": "Prompt cache reuse", "group": "KV cache", "cat": "performance", "type": "bool",
      "default": True, "help": "Reuse cached KV across requests with same prefix. Big speed win for editors/tools."},
     {"key": "temp", "label": "Temperature", "group": "Sampling", "cat": "accuracy", "type": "float",
-     "min": 0, "max": 2, "step": 0.01, "default": 0, "help": "0 = greedy (deterministic). Higher = more creative."},
+     "min": 0, "max": 2, "step": 0.01, "default": 0.2, "help": "0.2 = just enough randomness to break loops. 0 = deterministic."},
     {"key": "top_k", "label": "Top-K", "group": "Sampling", "cat": "accuracy", "type": "int",
-     "min": 1, "max": 100, "step": 1, "default": 1, "help": "Keep top K tokens. 1 = greedy."},
+     "min": 1, "max": 100, "step": 1, "default": 20, "help": "Consider top 20 tokens. Higher = more variety."},
     {"key": "top_p", "label": "Top-P", "group": "Sampling", "cat": "accuracy", "type": "float",
-     "min": 0, "max": 1, "step": 0.01, "default": 1, "help": "Nucleus sampling. 1 = disabled."},
+     "min": 0, "max": 1, "step": 0.01, "default": 1, "help": "Nucleus sampling. 1 = disabled. Keep at 1 for tool calls."},
     {"key": "min_p", "label": "Min-P", "group": "Sampling", "cat": "accuracy", "type": "float",
      "min": 0, "max": 1, "step": 0.01, "default": 0.05, "help": "Cut low-probability tokens."},
     {"key": "repeat_penalty", "label": "Repeat penalty", "group": "Sampling", "cat": "accuracy", "type": "float",
@@ -136,7 +136,7 @@ def auto_tune(hw, file_size_mb, layers=None, ctx_limit=None):
     partial = layers and p["n_gpu_layers"] < layers
     p["mlock"] = bool(partial and ram_free_gb > 2)
     p["mmap"] = True
-    p["temp"], p["top_k"], p["top_p"], p["min_p"], p["repeat_penalty"] = 0, 1, 1, 0.05, 1.0
+    p["temp"], p["top_k"], p["top_p"], p["min_p"], p["repeat_penalty"] = 0.2, 20, 1, 0.05, 1.0
     return p
 
 
