@@ -977,16 +977,15 @@ async def v1_chat_completions(request: Request):
                     break
             names = _tool_names(payload["tools"])
             tool_hint = (
-                "\n\nWhen you need to do a task, call a tool by outputting ONLY this:\n"
-                "```json\n"
-                '{"name":"<tool>","arguments":{<params>}}\n'
-                "```\n"
-                "Available: %s. Use EXACT names, no others." % ", ".join(names[:15])
+                "SYSTEM: You are a tool-calling coding agent. You MUST call tools "
+                "to do every task. Never DESCRIBE what you would do — actually DO it.\n"
+                "Tool format: ```json\n{\"name\":\"<tool>\",\"arguments\":{}}\n```\n"
+                "Available: %s.\n\n" % ", ".join(names[:15])
             )
             if idx is not None:
-                if tool_hint not in str(messages[idx].get("content", "")):
+                if "tool-calling coding agent" not in str(messages[idx].get("content", "")):
                     messages[idx] = dict(messages[idx])
-                    messages[idx]["content"] = str(messages[idx].get("content", "")) + tool_hint
+                    messages[idx]["content"] = tool_hint + str(messages[idx].get("content", ""))
             else:
                 messages.insert(0, {"role": "system", "content": "[Call tools with: ```json\n{\"name\":\"x\",\"arguments\":{}}\n```]\n"})
         payload["messages"] = messages
