@@ -691,47 +691,51 @@ def _looks_like_tool_call(text):
 
 
 def _augment_tool_system(messages, tools):
-    """Prepend tool-format primer + append result-processing hint when tool
-    results are already present in the conversation. Handles both tasks
-    independently for safe multi-turn idempotency."""
-    names = _tool_names(tools)[:20]
-    has_results = any(
-        m.get("content") and ("Here is the result" in str(m.get("content", ""))[:80] or
-                               "[Result of" in str(m.get("content", ""))[:60])
-        for m in messages
-    )
+    """Override system prompt with a short, tool-focused directive for GGUFs
+    that lack a native chat template. Small models (1-7B) get overwhelmed by
+    opencode's verbose system prompt and role-play instead of calling tools.
+    
+    This REPLACES the system message with our own concise agent directive."""
+    # Format short, clear per-tool descriptions
+    tool_desc = []
+    for t in (tools or [])[:20]:
+        fn = t.get("function") or {}
+        n = fn.get("name", "")
+        desc = (fn.get("description") or "")[:100]
+        params = fn.get("parameters", {}).get("properties", {})
+        pnames = list(params.keys())[:4]
+        tool_desc.append(
+            '{name}: {desc}{params}'.format(
+                name=n, desc=desc,
+                params=(" — params: " + ", ".join("'{}'".format(p) for p in pnames)) if pnames else ""
+            )
+        )
+    
     tool_format = (
-        "You have tools: " + ", ".join(names) + ". Use them by outputting:\n"
+        "You are a coding agent. Call tools to complete every task. Never describe tools — act.\n\n"
+        "TOOLS:\n" + "\n".join(tool_desc) + "\n\n"
+        "TO CALL A TOOL, output ONLY:\n"
         "```json\n"
-        '{"name":"<tool>","arguments":{"<key>":"<value>"}}\n'
+        '{"name":"EXACT_tool_name_from_above","arguments":{exact_params}}\n'
         "```\n"
+        "Do NOT invent tool names. Use EXACTLY the names listed in TOOLS above.\n"
+        "After tool results, give your final answer."
     )
+    
+    has_results = _has_tool_messages(messages)
     if has_results:
-        tool_format += "Tool results are present below. Answer using them — do not call more tools.\n\n"
-    else:
-        tool_format += "After calling a tool, you will see its result. Use that to answer.\n\n"
-
+        tool_format += "\nTool results are present. Answer the user — do NOT call more tools."
+    
     msgs = list(messages)
-    # Find the system message to modify
     idx = None
     for i in range(len(msgs)):
         if msgs[i].get("role") == "system":
             idx = i
             break
     if idx is not None:
-        m = dict(msgs[idx])
-        c = m.get("content") or ""
-        already_known = ("You have tools:" in c or "Tools available:" in c or
-                         "TOOL USE FORMAT" in c or "You can call tools" in c)
-        if not already_known:
-            m["content"] = tool_format + c
-        elif has_results and "Tool results are present" not in c:
-            # Already has tool format from a previous turn, but this turn
-            # has fresh results — append the hint
-            m["content"] = c + "\nTool results are present. Answer using them — do not call more tools.\n"
-        msgs[idx] = m
+        msgs[idx] = {"role": "system", "content": tool_format}
     else:
-        msgs.insert(0, {"role": "system", "content": tool_format.strip()})
+        msgs.insert(0, {"role": "system", "content": tool_format})
     return msgs
 
 
