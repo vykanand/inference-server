@@ -998,8 +998,6 @@ async def v1_chat_completions(request: Request):
                 with requests.post(target, json=payload, stream=True, timeout=600) as r:
                     if r.status_code != 200:
                         err_text = r.text[:600]
-                        # Context overflow: ONLY truncate as fallback on 400.
-                        # Lossless path: no truncation. 400 path: retry once.
                         if attempt == 0 and r.status_code == 400 and (
                             "context" in err_text.lower() or "exceed" in err_text.lower()):
                             msgs = payload.get("messages") or []
@@ -1008,11 +1006,12 @@ async def v1_chat_completions(request: Request):
                                 rest = msgs[1:] if sysmsg else msgs
                                 keep = max(1, len(rest) // 2)
                                 payload["messages"] = sysmsg + rest[-keep:]
-                                _log("truncate", kept=len(payload["messages"]), was=len(msgs), reason="ctx_400")
-                                continue  # retry
+                                _log("truncate", kept=len(payload["messages"]), reason="ctx_400")
+                                continue
                         yield _sse_err("llama-server %s: %s" % (r.status_code, err_text),
                                       "upstream_error" if r.status_code >= 500 else "invalid_request_error")
                         yield "data: [DONE]\n\n"
+                        _log("response", model=model_req, error=True, status=r.status_code)
                         return
                 for raw in r.iter_lines(decode_unicode=True):
                     if ct.is_cancelled:
@@ -1038,6 +1037,7 @@ async def v1_chat_completions(request: Request):
                         obj["model"] = model_req
 
                     if not has_tools:
+                        result["content_len"] += len(json.dumps(obj))
                         yield "data: " + json.dumps(obj) + "\n\n"
                         continue
 
