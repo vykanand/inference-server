@@ -839,8 +839,9 @@ def _normalize_messages(messages):
                     args = json.loads(fn.get("arguments") or "{}")
                 except Exception:
                     args = fn.get("arguments", {})
-                # NO backtick fences — models see ```json in history and snowball
-                parts.append("Called %s(%s)" % (fn.get("name", ""), json.dumps(args, ensure_ascii=False)))
+                # Factual bracket format — does NOT look like model output.
+                # Prevents: model sees "Called bash(...)" → outputs "Called bash(...)"
+                parts.append("[called %s]" % (fn.get("name", "")))
             out.append({"role": "assistant", "content": "\n".join(parts)})
         elif role == "tool":
             tcid = m.get("tool_call_id")
