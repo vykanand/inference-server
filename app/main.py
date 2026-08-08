@@ -932,10 +932,13 @@ def v1_models():
                 "owned_by": "local",
                 "port": e.get("port"),
                 "context_length": ctx,
+                "contextWindow": ctx,
                 "max_input_tokens": ctx,
                 "max_output_tokens": ctx,
                 "maxInputTokens": ctx,
                 "maxOutputTokens": ctx,
+                "inputTokens": ctx,
+                "outputTokens": ctx,
                 "capabilities": {
                     "tool_calling": True,
                     "streaming": True,
