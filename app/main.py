@@ -351,6 +351,10 @@ def chat(port: int, body: dict):
             messages = _augment_tool_system(messages, payload["tools"])
         messages, _, _ = truncate_messages(messages, budget)
         payload["messages"] = messages
+        if payload.get("tools"):
+            payload["temperature"] = 0.0
+            payload.pop("top_p", None)
+            payload.pop("top_k", None)
     if body.get("cache_prompt") is True:
         payload["cache_prompt"] = True
     return StreamingResponse(_stream_llama(port, payload), media_type="text/event-stream",
@@ -377,6 +381,10 @@ def _default_model_path():
         for f in found:
             if preferred.lower() in f.lower():
                 return f
+    for f in found:
+        low = f.lower()
+        if "coder" in low and "instruct" in low:
+            return f  # Qwen2.5-Coder, DeepSeek-Coder — best for tool calling
     for f in found:
         low = f.lower()
         if "coder" in low or "instruct" in low:
@@ -645,32 +653,36 @@ def _looks_like_tool_call(text):
 
 
 def _augment_tool_system(messages, tools):
-    """GGUF models without a native tool template (most local Qwen/Coder
-    GGUFs) won't emit OpenAI tool_calls. Append a strict output-format guide
-    so the model reliably produces the fenced-JSON shape our converter turns
-    into native tool_calls. Safe: only appends, never rewrites user content."""
-    names = _tool_names(tools)
-    instr = (
-        "\n\nTOOL USE FORMAT: When you decide to call a tool, reply with ONLY a "
-        "fenced JSON code block and no other text:\n```json\n"
-        "{\"name\": \"<tool_name>\", \"arguments\": {<valid json object>}}\n```\n"
-        "Use exactly one of these tool names: " + ", ".join(names) + ".\n"
-        "If you do not need a tool, just answer normally in plain text."
+    """GGUFs without native tool templates (most local Qwen/Coder GGUFs)
+    won't emit OpenAI tool_calls. Prepend a short, forceful directive BEFORE
+    the existing system prompt so even small/weak models process it first.
+    
+    The tool format instruction is kept under 300 chars to survive aggressive
+    ctx truncation on small-GPU (e.g. 4 GB) systems."""
+    names = _tool_names(tools)[:20]
+    tool_format = (
+        "IMPORTANT — You are a tool-calling agent. Respond this way only:\n"
+        "• To call a tool: output ONLY a fenced JSON block, no other text:\n"
+        "  ```json\n"
+        "  {\"name\":\"tool_name\",\"arguments\":{...}}\n"
+        "  ```\n"
+        "• To give final answer after tool results: use plain text.\n"
+        "Available tools: " + ", ".join(names) + "\n\n"
     )
     msgs = list(messages)
     idx = None
-    for i in range(len(msgs) - 1, -1, -1):
+    for i in range(len(msgs)):
         if msgs[i].get("role") == "system":
             idx = i
             break
     if idx is not None:
         m = dict(msgs[idx])
         c = m.get("content") or ""
-        if "TOOL USE FORMAT" not in c:
-            m["content"] = c + instr
+        if "CALL TOOLS USING" not in c and "tool-calling agent" not in c:
+            m["content"] = tool_format + c
         msgs[idx] = m
     else:
-        msgs.insert(0, {"role": "system", "content": instr.strip()})
+        msgs.insert(0, {"role": "system", "content": tool_format.strip()})
     return msgs
 
 
@@ -837,6 +849,17 @@ async def v1_chat_completions(request: Request):
         if was_truncated and eng.ready:
             eng.info["_truncated"] = True
             eng.info["_freed_tokens"] = freed
+        # Force temp=0 when tools present: weak models (1-7B) hallucinate JSON
+        # with any stochastic sampling. Deterministic decode fixes tool calling.
+        if payload.get("tools"):
+            payload["temperature"] = 0.0
+            payload.pop("top_p", None)
+            payload.pop("top_k", None)
+        # Warn if system prompt is huge — common opencode cause of weak-model confusion
+        sysp_len = sum(len(str(m.get("content",""))) for m in payload["messages"] if m.get("role") == "system")
+        if sysp_len > 4000:
+            eng.info["_huge_sysprompt"] = True
+            eng.info["_sysprompt_chars"] = sysp_len
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
