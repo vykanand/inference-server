@@ -359,7 +359,6 @@ def chat(port: int, body: dict):
     if isinstance(messages, list) and messages:
         if _has_tool_messages(messages):
             messages = _normalize_messages(messages)
-        messages, _, _ = truncate_messages(messages, budget)
         payload["messages"] = messages
     if body.get("cache_prompt") is True:
         payload["cache_prompt"] = True
@@ -957,22 +956,14 @@ async def v1_chat_completions(request: Request):
     # --- Context-aware message truncation (fixes "exceeds available context size") ---
     # Reserve room for the completion so we never overflow ctx on the reply either.
     ctx_limit = int(eng.params.get("ctx", 4096))
-    max_tokens_val = int(payload.get("max_tokens") or 512)
-    # Reserve a small safety margin (512 tokens) for generation output.
-    # The model's n_ctx includes prompt + completion. We use most of it
-    # for the prompt so the client's full context reaches the model.
-    budget = max(512, ctx_limit - min(512, max_tokens_val))
     messages = payload.get("messages")
     if isinstance(messages, list) and messages:
-        # Round-trip fix: llama-server cannot ingest OpenAI tool_calls /
-        # role:"tool" messages directly. Normalize them to plain text so
-        # multi-turn tool use works.
+        # Normalize tool_calls/tool-results to text (llama-server compatibility).
+        # This is the ONLY message transformation — no truncation, no dropping.
         if _has_tool_messages(messages):
             messages = _normalize_messages(messages)
-        # Minimal hint: append a tool output format reminder without replacing
-        # the client's system prompt. Needed because these GGUFs lack chat
-        # templates — llama-server's default template omits tool format.
-        # 60 chars, non-invasive, never overwrites client content.
+        # Minimal hint: prepend tool format instruction for models without
+        # chat templates. Essential — without it, tool calling is impossible.
         if payload.get("tools") and _tool_names(payload["tools"]):
             idx = None
             for i in range(len(messages)):
@@ -991,14 +982,10 @@ async def v1_chat_completions(request: Request):
                     messages[idx] = dict(messages[idx])
                     messages[idx]["content"] = tool_hint + str(messages[idx].get("content", ""))
             else:
-                messages.insert(0, {"role": "system", "content": "[Call tools with: ```json\n{\"name\":\"x\",\"arguments\":{}}\n```]\n"})
+                messages.insert(0, {"role": "system", "content": tool_hint.strip()})
         payload["messages"] = messages
-        truncated, was_truncated, freed = truncate_messages(messages, budget)
-        payload["messages"] = truncated
-        if was_truncated and eng.ready:
-            eng.info["_truncated"] = True
-            eng.info["_freed_tokens"] = freed
-            _log("truncate", freed=freed, kept=len(truncated), budget=budget, ctx=ctx_limit)
+        # NO preemptive truncation — the full conversation reaches the model.
+        # Truncation only happens as a fallback if llama-server returns 400.
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
@@ -1011,20 +998,18 @@ async def v1_chat_completions(request: Request):
                 with requests.post(target, json=payload, stream=True, timeout=600) as r:
                     if r.status_code != 200:
                         err_text = r.text[:600]
-                        # Context overflow retry: trim oldest non-system messages
+                        # Context overflow: ONLY truncate as fallback on 400.
+                        # Lossless path: no truncation. 400 path: retry once.
                         if attempt == 0 and r.status_code == 400 and (
                             "context" in err_text.lower() or "exceed" in err_text.lower()):
                             msgs = payload.get("messages") or []
                             if isinstance(msgs, list) and len(msgs) > 2:
-                                for m in msgs:
-                                    if m.get("role") != "system":
-                                        msgs.remove(m)
-                                        if len(msgs) <= 2:
-                                            break
-                                payload["messages"] = msgs
-                                if eng.ready:
-                                    eng.info["_retry_ctx"] = True
-                                continue  # retry the POST
+                                sysmsg = [msgs[0]] if msgs and msgs[0].get("role") == "system" else []
+                                rest = msgs[1:] if sysmsg else msgs
+                                keep = max(1, len(rest) // 2)
+                                payload["messages"] = sysmsg + rest[-keep:]
+                                _log("truncate", kept=len(payload["messages"]), was=len(msgs), reason="ctx_400")
+                                continue  # retry
                         yield _sse_err("llama-server %s: %s" % (r.status_code, err_text),
                                       "upstream_error" if r.status_code >= 500 else "invalid_request_error")
                         yield "data: [DONE]\n\n"
