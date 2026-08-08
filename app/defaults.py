@@ -3,7 +3,7 @@ PARAM_SPEC = [
      "cat": "performance", "type": "int", "min": 0, "max": 999, "step": 1, "default": 999,
      "help": "How many model layers to offload to the GPU. Set to total layer count (or 999) to fit the whole model on GPU if VRAM allows. Lower = more RAM, slower."},
     {"key": "ctx", "label": "Context size", "group": "Context", "cat": "context", "type": "int",
-     "min": 512, "max": 131072, "step": 256, "default": 32768,
+     "min": 512, "max": 131072, "step": 256, "default": 65536,
      "help": "Total prompt+completion token window. Auto-tune picks max that fits VRAM."},
     {"key": "batch", "label": "Batch size", "group": "Performance", "cat": "performance", "type": "int",
      "min": 32, "max": 8192, "step": 32, "default": 512,
@@ -28,11 +28,11 @@ PARAM_SPEC = [
     {"key": "cache_reuse", "label": "Prompt cache reuse", "group": "KV cache", "cat": "performance", "type": "bool",
      "default": True, "help": "Reuse cached KV across requests with same prefix. Big speed win for editors/tools."},
     {"key": "temp", "label": "Temperature", "group": "Sampling", "cat": "accuracy", "type": "float",
-     "min": 0, "max": 2, "step": 0.01, "default": 0.7, "help": "Creativity. 0 = greedy. Low = deterministic tool calls."},
+     "min": 0, "max": 2, "step": 0.01, "default": 0, "help": "0 = greedy (deterministic). Higher = more creative."},
     {"key": "top_k", "label": "Top-K", "group": "Sampling", "cat": "accuracy", "type": "int",
-     "min": 1, "max": 100, "step": 1, "default": 40, "help": "Keep top K tokens."},
+     "min": 1, "max": 100, "step": 1, "default": 1, "help": "Keep top K tokens. 1 = greedy."},
     {"key": "top_p", "label": "Top-P", "group": "Sampling", "cat": "accuracy", "type": "float",
-     "min": 0, "max": 1, "step": 0.01, "default": 0.95, "help": "Nucleus sampling."},
+     "min": 0, "max": 1, "step": 0.01, "default": 1, "help": "Nucleus sampling. 1 = disabled."},
     {"key": "min_p", "label": "Min-P", "group": "Sampling", "cat": "accuracy", "type": "float",
      "min": 0, "max": 1, "step": 0.01, "default": 0.05, "help": "Cut low-probability tokens."},
     {"key": "repeat_penalty", "label": "Repeat penalty", "group": "Sampling", "cat": "accuracy", "type": "float",
@@ -136,7 +136,7 @@ def auto_tune(hw, file_size_mb, layers=None, ctx_limit=None):
     partial = layers and p["n_gpu_layers"] < layers
     p["mlock"] = bool(partial and ram_free_gb > 2)
     p["mmap"] = True
-    p["temp"], p["top_k"], p["top_p"], p["min_p"], p["repeat_penalty"] = 0.7, 40, 0.95, 0.05, 1.0
+    p["temp"], p["top_k"], p["top_p"], p["min_p"], p["repeat_penalty"] = 0, 1, 1, 0.05, 1.0
     return p
 
 
