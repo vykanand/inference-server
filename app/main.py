@@ -38,8 +38,8 @@ def _log(tag, **kw):
     entry.update(kw)
     with _log_lock:
         _inf_log.append(entry)
-        if len(_inf_log) > 200:
-            _inf_log[:] = _inf_log[-150:]
+        if len(_inf_log) > 300:
+            _inf_log[:] = _inf_log[-200:]
 
 # ── cancellation token for client-disconnect propagation ────────────────
 class CancellationToken:
@@ -467,6 +467,9 @@ def truncate_messages(messages, ctx_limit):
     freed = 0
 
     while tail and (sum(_toks(messages[k]) for k in tail) + (run_toks(0, 0) if head else 0)) > ctx_limit:
+        # Never drop the last message — the model must have something to respond to
+        if len(tail) <= 1:
+            break
         idx = tail.pop(0)
         # If this message is part of a tool run, drop the whole run
         run_found = None
@@ -928,6 +931,7 @@ async def v1_chat_completions(request: Request):
     eng = await run_in_threadpool(_ensure_engine, model_req)
     _log("request", model=model_req, msgs=len(body.get("messages") or []),
          tools=len(body.get("tools") or []), stream=bool(body.get("stream")))
+    _req_start = time.time()
     if not eng or not eng.running:
         return JSONResponse(status_code=503, content=_err(
             "No local model is loaded and no .gguf model found to auto-load. "
@@ -994,6 +998,7 @@ async def v1_chat_completions(request: Request):
         if was_truncated and eng.ready:
             eng.info["_truncated"] = True
             eng.info["_freed_tokens"] = freed
+            _log("truncate", freed=freed, kept=len(truncated), budget=budget, ctx=ctx_limit)
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
@@ -1115,7 +1120,11 @@ async def v1_chat_completions(request: Request):
             except Exception as e:
                 yield _sse_err(str(e), "server_error")
         yield "data: [DONE]\n\n"
-        _log("response", model=model_req, tool_calls=saw_native, has_tools=has_tools)
+        _log("response", model=model_req, tool_calls=saw_native, has_tools=has_tools,
+             content_len=sum(len(c) for c in buf), finish=saw_finish,
+             buf_preview=("".join(buf)[:200] if buf else ""),
+             dur_s=round(time.time() - _req_start, 2),
+             truncated=was_truncated, error=False)
 
     if want_stream:
         return StreamingResponse(_stream_gen(), media_type="text/event-stream",
