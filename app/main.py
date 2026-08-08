@@ -1126,13 +1126,8 @@ async def v1_chat_completions(request: Request):
                                     (obj.get("choices") or [{}])[0].get("delta", {})["content"] = c
                                     yield "data: " + json.dumps(obj) + "\n\n"
                                 elif live_emit:
-                                    # Progressive streaming: emit content live unless
-                                    # a tool-call fence pattern is detected. Once a
-                                    # fence starts, switch to full buffering so the
-                                    # raw JSON isn't emitted as text (avoids duplicate
-                                    # content + tool_calls in the client).
-                                    trailing = "".join(buf)[-120:]
-                                    if "```json" in trailing or '```' in trailing[-10:]:
+                                    trailing = "".join(buf)[-200:]
+                                    if "```json" in trailing:
                                         live_emit = False
                                     else:
                                         yield _sse_chunk(content=c)
@@ -1170,7 +1165,11 @@ async def v1_chat_completions(request: Request):
                                         if not saw_finish:
                                             yield _sse_chunk(finish="stop")
                                 else:
-                                    if not saw_finish:
+                                    # No tool call detected. If we stopped live
+                                    # emission (false fence), emit buffered text.
+                                    if not live_emit:
+                                        yield _sse_chunk(content=full, finish="stop")
+                                    elif not saw_finish:
                                         yield _sse_chunk(finish="stop")
                             else:
                                 yield _sse_chunk(finish="stop")
