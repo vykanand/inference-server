@@ -976,7 +976,13 @@ async def v1_chat_completions(request: Request):
                     idx = i
                     break
             names = _tool_names(payload["tools"])
-            tool_hint = "\n[Tools: %s. Format: {\"name\":\"x\",\"arguments\":{}}]" % ", ".join(names[:15])
+            tool_hint = (
+                "\n\nWhen you need to do a task, call a tool by outputting ONLY this:\n"
+                "```json\n"
+                '{"name":"<tool>","arguments":{<params>}}\n'
+                "```\n"
+                "Available: %s. Use EXACT names, no others." % ", ".join(names[:15])
+            )
             if idx is not None:
                 if tool_hint not in str(messages[idx].get("content", "")):
                     messages[idx] = dict(messages[idx])
