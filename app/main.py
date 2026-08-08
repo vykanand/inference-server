@@ -661,13 +661,14 @@ def _augment_tool_system(messages, tools):
     ctx truncation on small-GPU (e.g. 4 GB) systems."""
     names = _tool_names(tools)[:20]
     tool_format = (
-        "IMPORTANT — You are a tool-calling agent. Respond this way only:\n"
-        "• To call a tool: output ONLY a fenced JSON block, no other text:\n"
-        "  ```json\n"
-        "  {\"name\":\"tool_name\",\"arguments\":{...}}\n"
-        "  ```\n"
-        "• To give final answer after tool results: use plain text.\n"
-        "Available tools: " + ", ".join(names) + "\n\n"
+        "IMPORTANT — You have EXACTLY these tools and NO others. "
+        "If asked something you cannot do, explain in plain text — never make up tool names.\n"
+        "Tools: " + ", ".join(names) + ".\n"
+        "To call a tool, output ONLY this exact format (no other words):\n"
+        "```json\n"
+        "{\"name\":\"one_of_the_above\",\"arguments\":{...}}\n"
+        "```\n"
+        "For everything else, answer in plain text. Do NOT invent tool names.\n\n"
     )
     msgs = list(messages)
     idx = None
@@ -772,7 +773,11 @@ def _convert_tool_text(obj, tools=None):
         tcs = _extract_tool_calls(content, tools)
         if not tcs:
             return obj
-        msg["tool_calls"] = _wrap_tool_calls(tcs)
+        valid_names = _tool_names(tools)
+        valid_tcs = [(n, a) for n, a in tcs if n in valid_names]
+        if not valid_tcs:
+            return obj  # all tool names invalid — leave as text
+        msg["tool_calls"] = _wrap_tool_calls(valid_tcs)
         msg["content"] = ""
         choices[0]["finish_reason"] = "tool_calls"
         obj["choices"] = choices
@@ -931,8 +936,21 @@ async def v1_chat_completions(request: Request):
                             if before:
                                 yield _sse_chunk(content=before)
                             if tcs:
-                                yield _sse_chunk(tool_calls=_wrap_tool_calls(tcs))
-                                yield _sse_chunk(finish="tool_calls")
+                                # Validate tool names — unknown tools get converted to text
+                                # instead of being emitted as broken tool calls.
+                                valid_tool_names = _tool_names(tools)
+                                valid_tcs = [(n, a) for n, a in tcs if n in valid_tool_names]
+                                bad_names = [n for n, _ in tcs if n not in valid_tool_names]
+                                if valid_tcs:
+                                    yield _sse_chunk(tool_calls=_wrap_tool_calls(valid_tcs))
+                                    yield _sse_chunk(finish="tool_calls")
+                                elif bad_names:
+                                    msg = ("Model tried to call unavailable tool(s): " +
+                                           ", ".join(bad_names) +
+                                           ". Available: " + ", ".join(valid_tool_names[:15]) + ".")
+                                    yield _sse_chunk(content=msg, finish="stop")
+                                else:
+                                    yield _sse_chunk(finish="stop")
                             if after:
                                 yield _sse_chunk(content=after, finish="stop")
                             elif not tcs:
