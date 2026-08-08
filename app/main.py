@@ -347,8 +347,6 @@ def chat(port: int, body: dict):
     if isinstance(messages, list) and messages:
         if _has_tool_messages(messages):
             messages = _normalize_messages(messages)
-        if payload.get("tools"):
-            messages = _augment_tool_system(messages, payload["tools"])
         messages, _, _ = truncate_messages(messages, budget)
         payload["messages"] = messages
     if body.get("cache_prompt") is True:
@@ -908,31 +906,24 @@ async def v1_chat_completions(request: Request):
     # --- Context-aware message truncation (fixes "exceeds available context size") ---
     # Reserve room for the completion so we never overflow ctx on the reply either.
     ctx_limit = int(eng.params.get("ctx", 4096))
-    max_tokens = int(payload.get("max_tokens") or 512)
-    budget = max(512, ctx_limit - max_tokens)
+    max_tokens_val = int(payload.get("max_tokens") or 512)
+    # Reserve minimal room for generation — just enough to prevent 400 errors.
+    # The client controls max_tokens; we only keep a safety margin.
+    budget = max(512, ctx_limit - max(128, min(max_tokens_val, 4096)))
     messages = payload.get("messages")
     if isinstance(messages, list) and messages:
-        # Round-trip fix: llama-server (no native tool template) cannot ingest
-        # OpenAI tool_calls / role:"tool" messages, which breaks multi-turn tool
-        # use and causes abrupt stops. Normalize them to plain text first.
+        # Round-trip fix: llama-server cannot ingest OpenAI tool_calls /
+        # role:"tool" messages directly. Normalize them to plain text so
+        # multi-turn tool use works. This is the ONLY message transformation —
+        # we never modify system prompts, tool definitions, or parameters.
         if _has_tool_messages(messages):
             messages = _normalize_messages(messages)
-        # Models without a native tool template need a format hint so they
-        # reliably emit the fenced-JSON shape we convert to tool_calls.
-        # Augment BEFORE truncating so the added text is counted in ctx budget.
-        if payload.get("tools"):
-            messages = _augment_tool_system(messages, payload["tools"])
         payload["messages"] = messages
         truncated, was_truncated, freed = truncate_messages(messages, budget)
         payload["messages"] = truncated
         if was_truncated and eng.ready:
             eng.info["_truncated"] = True
             eng.info["_freed_tokens"] = freed
-        # Force low temperature when tools present. opencode sends ~0.7 which
-        # causes verbose descriptions instead of tool-calling. 0.1 is deterministic
-        # enough for reliable tool JSON without the degenerate repetition of 0.0.
-        if payload.get("tools") and payload.get("temperature", 0.7) > 0.2:
-            payload["temperature"] = 0.1
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
