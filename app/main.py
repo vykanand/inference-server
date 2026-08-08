@@ -1013,9 +1013,10 @@ async def v1_chat_completions(request: Request):
                 project_ctx = ""
             tool_hint = (
                 project_ctx +
-                "SYSTEM: You are a tool-calling coding agent. You MUST call tools "
-                "to do every task. Never DESCRIBE what you would do — actually DO it.\n"
-                "Tool format: ```json\n{\"name\":\"<tool>\",\"arguments\":{}}\n```\n"
+                "You have tools. ALWAYS call them to act — never ask the user to do anything.\n"
+                "Your FIRST response to ANY request must be a tool call, not text.\n"
+                "Only use text after receiving tool results to summarize findings.\n"
+                "Format: ```json\n{\"name\":\"<tool>\",\"arguments\":{...}}\n```\n"
                 "Available: %s.\n\n" % ", ".join(names[:15])
             )
             if idx is not None:
