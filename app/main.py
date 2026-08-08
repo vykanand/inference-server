@@ -337,7 +337,7 @@ def chat(port: int, body: dict):
     # Truncate defensively so even direct engine calls never 400 on ctx overflow.
     ctx_limit = int(eng.params.get("ctx", 4096))
     max_tokens = int(body.get("max_tokens") or 512)
-    budget = max(512, ctx_limit - max_tokens)
+    budget = max(512, ctx_limit - min(512, max_tokens))
     payload = {"messages": messages, "stream": True, "max_tokens": max_tokens}
     for k in ("temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty",
               "frequency_penalty", "stop", "tools", "tool_choice", "parallel_tool_calls",
@@ -656,21 +656,35 @@ def _extract_tool_calls(content, tools=None):
 
 def _split_tool_and_text(full, tools):
     """Split response into (text_before, [(name,args),...], text_after).
-    Returns None when no tool calls are present."""
-    m = _FENCE_BLOCK_RE.search(full)
-    if not m:
+    Handles multiple fenced blocks. Returns None when no tool calls are present."""
+    segments = []
+    pos = 0
+    for m in _FENCE_BLOCK_RE.finditer(full):
+        text_before = full[pos:m.start()].strip()
+        tcs = _extract_tool_calls(m.group(1), tools)
+        if tcs:
+            segments.append(("text", text_before) if text_before else None)
+            segments.append(("tools", tcs))
+            pos = m.end()
+    if not segments:
         # Also try bare JSON at the end
         tcs = _extract_tool_calls(full.strip(), tools)
         if tcs:
-            # Full response is the tool call(s), no text before
             return "", tcs, ""
         return None
-    before = full[:m.start()].strip()
-    after = full[m.end():].strip()
-    tcs = _extract_tool_calls(m.group(1), tools)
-    if not tcs:
-        return None
-    return before, tcs, after
+    # Flatten: first text segment + all tool calls + trailing text
+    after = full[pos:].strip()
+    first_text = ""
+    all_tcs = []
+    for seg in segments:
+        if seg is None:
+            continue
+        kind, val = seg
+        if kind == "text" and not first_text:
+            first_text = val
+        elif kind == "tools":
+            all_tcs.extend(val)
+    return first_text, all_tcs, after
 
 
 def _looks_like_tool_call(text):
@@ -903,9 +917,10 @@ async def v1_chat_completions(request: Request):
     # Reserve room for the completion so we never overflow ctx on the reply either.
     ctx_limit = int(eng.params.get("ctx", 4096))
     max_tokens_val = int(payload.get("max_tokens") or 512)
-    # Reserve minimal room for generation — just enough to prevent 400 errors.
-    # The client controls max_tokens; we only keep a safety margin.
-    budget = max(512, ctx_limit - max(128, min(max_tokens_val, 4096)))
+    # Reserve a small safety margin (512 tokens) for generation output.
+    # The model's n_ctx includes prompt + completion. We use most of it
+    # for the prompt so the client's full context reaches the model.
+    budget = max(512, ctx_limit - min(512, max_tokens_val))
     messages = payload.get("messages")
     if isinstance(messages, list) and messages:
         # Round-trip fix: llama-server cannot ingest OpenAI tool_calls /
@@ -941,16 +956,32 @@ async def v1_chat_completions(request: Request):
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
         tools = payload.get("tools")
-        buf = []
-        saw_native = False
-        saw_finish = None
-        try:
-            with requests.post(target, json=payload, stream=True, timeout=600) as r:
-                if r.status_code != 200:
-                    yield _sse_err("llama-server %s: %s" % (r.status_code, r.text[:500]),
-                                   "upstream_error" if r.status_code >= 500 else "invalid_request_error")
-                    yield "data: [DONE]\n\n"
-                    return
+        for attempt in (0, 1):
+            buf = []
+            saw_native = False
+            saw_finish = None
+            try:
+                with requests.post(target, json=payload, stream=True, timeout=600) as r:
+                    if r.status_code != 200:
+                        err_text = r.text[:600]
+                        # Context overflow retry: trim oldest non-system messages
+                        if attempt == 0 and r.status_code == 400 and (
+                            "context" in err_text.lower() or "exceed" in err_text.lower()):
+                            msgs = payload.get("messages") or []
+                            if isinstance(msgs, list) and len(msgs) > 2:
+                                for m in msgs:
+                                    if m.get("role") != "system":
+                                        msgs.remove(m)
+                                        if len(msgs) <= 2:
+                                            break
+                                payload["messages"] = msgs
+                                if eng.ready:
+                                    eng.info["_retry_ctx"] = True
+                                continue  # retry the POST
+                        yield _sse_err("llama-server %s: %s" % (r.status_code, err_text),
+                                      "upstream_error" if r.status_code >= 500 else "invalid_request_error")
+                        yield "data: [DONE]\n\n"
+                        return
                 for raw in r.iter_lines(decode_unicode=True):
                     if ct.is_cancelled:
                         r.close()
@@ -1037,8 +1068,10 @@ async def v1_chat_completions(request: Request):
                 elif not has_tools:
                     if not saw_finish:
                         yield _sse_chunk(finish="stop")
-        except Exception as e:
-            yield _sse_err(str(e), "server_error")
+                # Stream succeeded, exit retry loop
+                break
+            except Exception as e:
+                yield _sse_err(str(e), "server_error")
         yield "data: [DONE]\n\n"
 
     if want_stream:
