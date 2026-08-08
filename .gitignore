@@ -1,0 +1,7 @@
+models/
+llama-server/
+engine_pids.json
+
+__pycache__/
+*.pyc
+.env

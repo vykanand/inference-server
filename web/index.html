@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Inference Server</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">⚡ Llama Server <span id="engineCount" class="pill">0 engines</span></div>
+  <div class="hw">
+    <div class="hw-item"><span class="hw-label">VRAM</span>
+      <div class="bar"><div id="vramBar" class="bar-fill"></div></div>
+      <span id="vramText" class="hw-val">-</span></div>
+    <div class="hw-item"><span class="hw-label">RAM</span>
+      <div class="bar"><div id="ramBar" class="bar-fill ram"></div></div>
+      <span id="ramText" class="hw-text">-</span></div>
+    <div class="hw-item narrow"><span>GPU</span><span id="gpuUtil">-</span></div>
+    <div class="hw-item narrow"><span>Engine</span><span id="engineState">-</span></div>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="models">Models</button>
+  <button class="tab" data-tab="test">Test Chat</button>
+  <button class="tab" data-tab="config">Config Chat</button>
+  <div class="tab-actions">
+    <button id="loadBtn" class="primary small">+ Load Model</button>
+    <button id="refreshBtn" class="small">Refresh</button>
+    <button id="settingsBtn" class="small">Settings</button>
+  </div>
+</nav>
+
+<div id="toast" class="toast hidden"></div>
+
+<main>
+  <!-- ============ MODELS TAB ============ -->
+  <section id="tab-models" class="panel active">
+    <div class="cols">
+      <div class="col engines-col">
+        <h3>Loaded Engines</h3>
+        <div id="engineList" class="card-list"></div>
+        <h3>Local GGUF Models</h3>
+        <div id="localList" class="card-list"></div>
+      </div>
+      <div class="col hub-col">
+        <h3>Model Hub <span class="muted">(HuggingFace · GGUF)</span></h3>
+        <div class="hub-search">
+          <input id="searchInput" placeholder="search models, e.g. qwen 3b instruct Q4">
+          <button id="searchBtn" class="primary">Search</button>
+        </div>
+        <div id="dlList" class="card-list"></div>
+        <div id="hubResults" class="card-list scroll"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ TEST CHAT TAB ============ -->
+  <section id="tab-test" class="panel">
+    <div class="chat-cols">
+      <div class="col-side">
+        <label>Loaded model</label>
+        <select id="testModelSel"></select>
+        <label>Max tokens</label>
+        <input type="number" id="testMaxTokens" value="512" min="32" step="32">
+        <h4>Sampling (per request)</h4>
+        <div class="params" id="testParams"></div>
+        <button id="clearChatBtn" class="small">Clear chat</button>
+      </div>
+      <div class="col-main">
+        <div id="testChat" class="chat-log"></div>
+        <div class="msg-row">
+          <textarea id="testInput" rows="2" placeholder="Ask the local model..."></textarea>
+          <button id="testSend" class="primary">Send</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ CONFIG CHAT TAB ============ -->
+  <section id="tab-config" class="panel">
+    <div class="chat-cols">
+      <div class="col-side">
+        <label>OpenRouter model</label>
+        <input id="orModel" list="orModelList" placeholder="model id">
+        <datalist id="orModelList"></datalist>
+        <button id="orRefresh" class="small">Refresh free models</button>
+        <label class="chk"><input type="checkbox" id="autoApply" checked> auto-apply config changes</label>
+        <h4>Active engine for tuning</h4>
+        <select id="configEngineSel"></select>
+        <div class="config-hint">Ask the router to change speed/accuracy settings. It returns JSON changes and restarts the engine live.</div>
+      </div>
+      <div class="col-main">
+        <div id="configChat" class="chat-log">
+          <div class="msg sys">
+            <div class="msg-role">System</div>
+            <div class="msg-body">Ask the AI to tune the running model, e.g. "make it faster", "reduce VRAM usage", "more accurate", "raise quality". Changes apply in real time.</div>
+          </div>
+        </div>
+        <div class="msg-row">
+          <textarea id="configInput" rows="2" placeholder='Tell the router how to tune, e.g. "increase speed, lower VRAM"'></textarea>
+          <button id="configSend" class="primary">Send</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ============ LOAD MODAL ============ -->
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head"><h2>Load Model</h2><button id="modalClose" class="x">×</button></div>
+    <div class="modal-col">
+      <div class="modal-left">
+        <label>Model file</label>
+        <select id="loadFileSel"></select>
+        <a id="loadMeta" class="model-meta"></a>
+        <label>GPU offload</label>
+        <div class="slide-row">
+          <input type="range" id="param-n_gpu_layers" min="0" max="999" step="1">
+          <span id="nglVal" class="val"></span>
+        </div>
+        <div id="fitHint" class="fit-hint"></div>
+        <div id="paramList" class="params"></div>
+      </div>
+      <div class="modal-right">
+        <div class="stats-card">
+          <div class="stat"><div class="s-label">Layers</div><div id="stLayers">-</div></div>
+          <div class="stat"><div class="s-label">File size</div><div id="stSize">-</div></div>
+          <div class="stat"><div class="s-label">Est VRAM</div><div id="stVram">-</div></div>
+          <div class="stat"><div class="s-label">Free VRAM</div><div id="stFree">-</div></div>
+        </div>
+        <div class="fit-toggle">
+          <button id="fitFullBtn" class="small">Fit full GPU</button>
+          <button id="fitRamBtn" class="small">Fit under VRAM</button>
+        </div>
+        <button id="loadConfirm" class="primary block">Load & start server</button>
+        <div id="loadStatus" class="load-status"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SETTINGS MODAL ============ -->
+<div id="settingsModal" class="modal hidden">
+  <div class="modal-box narrow">
+    <div class="modal-head"><h2>Settings</h2><button id="settingsClose" class="x">×</button></div>
+    <label>OpenRouter API key</label>
+    <input id="orKey" type="password" placeholder="sk-or-...">
+    <label>HuggingFace token (for gated models)</label>
+    <input id="hfKey" type="password" placeholder="optional">
+    <button id="settingsSave" class="primary block">Save</button>
+  </div>
+</div>
+
+<!-- ============ FILES MODAL ============ -->
+<div id="fileModal" class="modal hidden">
+  <div class="modal-box narrow">
+    <div class="modal-head"><h2 id="fileModalTitle"></h2><button id="fileModalClose" class="x">×</button></div>
+    <div id="fileModalBody" class="card-list"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
