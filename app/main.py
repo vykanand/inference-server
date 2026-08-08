@@ -924,14 +924,18 @@ def v1_models():
     for e in manager.list():
         if e.get("running"):
             ctx = e.get("params", {}).get("ctx", 4096)
+            mid = (e.get("model_name") or "local").replace(".gguf", "")
             data.append({
-                "id": e.get("model_name") or "local",
+                "id": mid,
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "local",
                 "port": e.get("port"),
                 "context_length": ctx,
+                "max_input_tokens": ctx,
                 "max_output_tokens": ctx,
+                "maxInputTokens": ctx,
+                "maxOutputTokens": ctx,
                 "capabilities": {
                     "tool_calling": True,
                     "streaming": True,
@@ -943,7 +947,8 @@ def v1_models():
             })
     if not data:
         data.append({"id": "local", "object": "model", "created": 0, "owned_by": "local",
-                       "context_length": 0, "max_output_tokens": 0,
+                       "context_length": 0, "max_input_tokens": 0, "max_output_tokens": 0,
+                       "maxInputTokens": 0, "maxOutputTokens": 0,
                        "capabilities": {"tool_calling": False, "streaming": True, "reasoning": False}})
     return {"object": "list", "data": data}
 
