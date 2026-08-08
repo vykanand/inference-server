@@ -988,161 +988,144 @@ async def v1_chat_completions(request: Request):
         # Truncation only happens as a fallback if llama-server returns 400.
 
     def _stream_gen():
-        _log("forward", model=model_req, port=eng.port,
-             msgs=len(payload.get("messages") or []),
-             tools=len(payload.get("tools") or []),
-             max_tokens=payload.get("max_tokens"))
         has_tools = bool(payload.get("tools"))
         tools = payload.get("tools")
-        result = {"content_len": 0}
-        was_truncated = False
-        for attempt in (0, 1):
-            buf = []
-            saw_native = False
-            saw_finish = None
-            try:
-                with requests.post(target, json=payload, stream=True, timeout=600) as r:
-                    if r.status_code != 200:
-                        err_text = r.text[:600]
-                        if attempt == 0 and r.status_code == 400 and (
-                            "context" in err_text.lower() or "exceed" in err_text.lower()):
-                            msgs = payload.get("messages") or []
-                            if isinstance(msgs, list) and len(msgs) > 2:
-                                sysmsg = [msgs[0]] if msgs and msgs[0].get("role") == "system" else []
-                                rest = msgs[1:] if sysmsg else msgs
-                                keep = max(1, len(rest) // 2)
-                                payload["messages"] = sysmsg + rest[-keep:]
-                                _log("truncate", kept=len(payload["messages"]), reason="ctx_400")
-                                continue
-                        yield _sse_err("llama-server %s: %s" % (r.status_code, err_text),
-                                      "upstream_error" if r.status_code >= 500 else "invalid_request_error")
-                        yield "data: [DONE]\n\n"
-                        _log("response", model=model_req, error=True, status=r.status_code)
-                        return
-                    for raw in r.iter_lines(decode_unicode=True):
-                        if ct.is_cancelled:
-                            r.close()
-                            yield _sse_err("client disconnected", "cancelled")
+        buf = []           # accumulated content for text-to-tool conversion
+        saw_native = False
+        saw_finish = None
+        chunk_count = 0
+        content_chars = 0
+        try:
+            for attempt in (0, 1):
+                buf.clear(); saw_native = False; saw_finish = None
+                try:
+                    with requests.post(target, json=payload, stream=True, timeout=600) as r:
+                        if r.status_code != 200:
+                            err_text = r.text[:600]
+                            if attempt == 0 and r.status_code == 400 and (
+                                "context" in err_text.lower() or "exceed" in err_text.lower()):
+                                msgs = payload.get("messages") or []
+                                if isinstance(msgs, list) and len(msgs) > 2:
+                                    sysmsg = [msgs[0]] if msgs and msgs[0].get("role") == "system" else []
+                                    rest = msgs[1:] if sysmsg else msgs
+                                    keep = max(1, len(rest) // 2)
+                                    payload["messages"] = sysmsg + rest[-keep:]
+                                    _log("truncate", kept=len(payload["messages"]), reason="ctx_400")
+                                    continue
+                            yield _sse_err("llama-server %s: %s" % (r.status_code, err_text),
+                                          "upstream_error" if r.status_code >= 500 else "invalid_request_error")
                             yield "data: [DONE]\n\n"
+                            _log("response", model=model_req, error=True, status=r.status_code,
+                                 dur_s=round(time.time() - _req_start, 2))
                             return
-                        if not raw:
-                            continue
-                        if not raw.startswith("data:"):
-                            yield raw + "\n\n"
-                            continue
-                        d = raw[5:].strip()
-                        if d == "[DONE]":
-                            continue
-                        if not has_tools:
-                            result["content_len"] += len(raw)
-                            yield raw + "\n\n"
-                            continue
-                        try:
-                            obj = json.loads(d)
-                        except Exception:
-                            yield _sse_err("invalid JSON from upstream: %s" % str(raw)[:300],
-                                           "invalid_response_error")
-                            continue
-                        if isinstance(obj, dict) and obj.get("model"):
-                            obj["model"] = model_req
 
-                        # ── tools path ───────────────────────────────────────
-                        delta = (obj.get("choices") or [{}])[0].get("delta") or {}
-                        if delta.get("tool_calls"):
-                            if buf and not saw_native:
-                                yield _sse_chunk(content="".join(buf))
-                                buf = []
-                            saw_native = True
-                            yield "data: " + json.dumps(obj) + "\n\n"
-                            continue
-                    if not raw.startswith("data:"):
-                        yield raw + "\n\n"
-                        continue
-                    d = raw[5:].strip()
-                    if d == "[DONE]":
-                        continue
-                    try:
-                        obj = json.loads(d)
-                    except Exception:
-                        yield _sse_err("invalid JSON from upstream: %s" % str(raw)[:300],
-                                       "invalid_response_error")
-                        continue
-                    if isinstance(obj, dict) and obj.get("model"):
-                        obj["model"] = model_req
+                        for raw in r.iter_lines(decode_unicode=True):
+                            if ct.is_cancelled:
+                                r.close()
+                                yield _sse_err("client disconnected", "cancelled")
+                                yield "data: [DONE]\n\n"
+                                _log("response", model=model_req, cancelled=True,
+                                     dur_s=round(time.time() - _req_start, 2))
+                                return
+                            if not raw or not raw.startswith("data:"):
+                                continue
+                            chunk_count += 1
+                            d = raw[5:].strip()
+                            if d == "[DONE]":
+                                continue
 
-                    if not has_tools:
-                        yield raw + "\n\n"
-                        continue
+                            # --- non-tool path: relay raw SSE directly ---
+                            if not has_tools:
+                                yield raw + "\n\n"
+                                try:
+                                    obj = json.loads(d)
+                                    dc = (obj.get("choices") or [{}])[0].get("delta") or {}
+                                    c = dc.get("content")
+                                    if c:
+                                        content_chars += len(c)
+                                        buf.append(c)
+                                    fr = dc.get("finish_reason")
+                                    if fr:
+                                        saw_finish = fr
+                                except Exception:
+                                    pass
+                                continue
 
-                    # ── tools path ───────────────────────────────────────
-                    delta = (obj.get("choices") or [{}])[0].get("delta") or {}
-                    if delta.get("tool_calls"):
-                        if buf and not saw_native:
-                            yield _sse_chunk(content="".join(buf))
-                            buf = []
-                        saw_native = True
-                        yield "data: " + json.dumps(obj) + "\n\n"
-                        continue
-
-                    c = delta.get("content")
-                    if c:
-                        if saw_native:
-                            yield "data: " + json.dumps(obj) + "\n\n"
-                        else:
-                            buf.append(c)
-                    fr = delta.get("finish_reason")
-                    if fr:
-                        saw_finish = fr
-
-                # ── stream ended ─────────────────────────────────────────
-                if has_tools and not saw_native:
-                    full = "".join(buf)
-                    if full:
-                        seg = _split_tool_and_text(full, tools)
-                        if seg:
-                            before, tcs, after = seg
-                            if before:
-                                yield _sse_chunk(content=before)
-                            if tcs:
-                                # Validate tool names — unknown tools get converted to text
-                                # instead of being emitted as broken tool calls.
-                                valid_tool_names = _tool_names(tools)
-                                valid_tcs = [(n, a) for n, a in tcs if n in valid_tool_names]
-                                bad_names = [n for n, _ in tcs if n not in valid_tool_names]
-                                if valid_tcs:
-                                    yield _sse_chunk(tool_calls=_wrap_tool_calls(valid_tcs))
-                                    yield _sse_chunk(finish="tool_calls")
-                                elif bad_names:
-                                    msg = ("Model tried to call unavailable tool(s): " +
-                                           ", ".join(bad_names) +
-                                           ". Available: " + ", ".join(valid_tool_names[:15]) + ".")
-                                    yield _sse_chunk(content=msg, finish="stop")
+                            # --- tool path ---
+                            try:
+                                obj = json.loads(d)
+                            except Exception:
+                                yield _sse_err("invalid JSON: %s" % str(raw)[:200], "invalid_response_error")
+                                continue
+                            if isinstance(obj, dict) and obj.get("model"):
+                                obj["model"] = model_req
+                            delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+                            if delta.get("tool_calls"):
+                                if buf and not saw_native:
+                                    yield _sse_chunk(content="".join(buf))
+                                    buf.clear()
+                                saw_native = True
+                                content_chars += len(json.dumps(obj))
+                                yield "data: " + json.dumps(obj) + "\n\n"
+                                continue
+                            c = delta.get("content")
+                            if c:
+                                content_chars += len(c)
+                                if saw_native:
+                                    yield "data: " + json.dumps(obj) + "\n\n"
                                 else:
-                                    yield _sse_chunk(finish="stop")
-                            if after:
-                                yield _sse_chunk(content=after, finish="stop")
-                            elif not tcs:
+                                    buf.append(c)
+                            fr = delta.get("finish_reason")
+                            if fr:
+                                saw_finish = fr
+
+                        # --- stream ended: emit final chunk ---
+                        if has_tools and not saw_native:
+                            full = "".join(buf)
+                            if full:
+                                seg = _split_tool_and_text(full, tools)
+                                if seg:
+                                    before, tcs, after = seg
+                                    if before:
+                                        yield _sse_chunk(content=before)
+                                    if tcs:
+                                        valid_names = _tool_names(tools)
+                                        valid_tcs = [(n, a) for n, a in tcs if n in valid_names]
+                                        bad_names = [n for n, _ in tcs if n not in valid_names]
+                                        if valid_tcs:
+                                            yield _sse_chunk(tool_calls=_wrap_tool_calls(valid_tcs))
+                                            yield _sse_chunk(finish="tool_calls")
+                                        elif bad_names:
+                                            msg = ("Model tried to call unavailable tool(s): " +
+                                                   ", ".join(bad_names) +
+                                                   ". Available: " + ", ".join(valid_names[:15]) + ".")
+                                            yield _sse_chunk(content=msg, finish="stop")
+                                        else:
+                                            yield _sse_chunk(finish="stop")
+                                    if after:
+                                        yield _sse_chunk(content=after, finish="stop")
+                                else:
+                                    yield _sse_chunk(content=full, finish="stop")
+                            else:
                                 yield _sse_chunk(finish="stop")
-                        else:
-                            yield _sse_chunk(content=full, finish="stop")
-                    else:
-                        yield _sse_chunk(finish="stop")
-                elif has_tools and saw_native:
-                    if not saw_finish:
-                        yield _sse_chunk(finish="stop")
-                elif not has_tools:
-                    if not saw_finish:
-                        yield _sse_chunk(finish="stop")
-                # Stream succeeded, exit retry loop
-                break
-            except Exception as e:
-                yield _sse_err(str(e), "server_error")
-        yield "data: [DONE]\n\n"
+                        elif has_tools and saw_native:
+                            if not saw_finish:
+                                yield _sse_chunk(finish="stop")
+                        elif not has_tools:
+                            if not saw_finish:
+                                yield _sse_chunk(finish="stop")
+                        break  # success — exit retry loop
+                except Exception as e:
+                    if attempt == 1:
+                        yield _sse_err(str(e), "server_error")
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield _sse_err(str(e), "server_error")
+            yield "data: [DONE]\n\n"
         _log("response", model=model_req, tool_calls=saw_native, has_tools=has_tools,
-             content_len=sum(len(c) for c in buf), finish=saw_finish,
-             buf_preview=("".join(buf)[:200] if buf else ""),
-             dur_s=round(time.time() - _req_start, 2),
-             truncated=was_truncated, error=False)
+             chunks=chunk_count, content_chars=content_chars, finish=saw_finish,
+             buf_preview="".join(buf)[:200] if buf else "",
+             dur_s=round(time.time() - _req_start, 2))
 
     if want_stream:
         return StreamingResponse(_stream_gen(), media_type="text/event-stream",
