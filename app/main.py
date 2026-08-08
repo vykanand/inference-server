@@ -695,24 +695,48 @@ def _augment_tool_system(messages, tools):
     that lack a native chat template. Small models (1-7B) get overwhelmed by
     opencode's verbose system prompt and role-play instead of calling tools.
     
-    This REPLACES the system message with our own concise agent directive."""
-    # Format short, clear per-tool descriptions
+    This REPLACES the system message with our own concise agent directive.
+    Action tools (bash/read/grep/glob/edit) are listed first with clear
+    descriptions. question is demoted to last-resort to prevent the model
+    from clarifying instead of acting."""
+    # Sort: action tools first, question-type tools last
+    priority_tools = ("bash", "read", "grep", "glob", "edit", "write", "task", "skill",
+                      "todowrite", "question", "webfetch")
+    ordered = []
+    rest = list(tools or [])
+    for pn in priority_tools:
+        for t in rest[:]:
+            if t.get("function", {}).get("name") == pn:
+                ordered.append(t)
+                rest.remove(t)
+                break
+    ordered.extend(rest)
+    
     tool_desc = []
-    for t in (tools or [])[:20]:
+    for t in ordered[:20]:
         fn = t.get("function") or {}
         n = fn.get("name", "")
-        desc = (fn.get("description") or "")[:100]
+        desc = (fn.get("description") or "")[:80]
         params = fn.get("parameters", {}).get("properties", {})
         pnames = list(params.keys())[:4]
+        pmap = {}  # noqa - only used below
+        # Add note for special tools
+        note = ""
+        if n == "question":
+            note = " [LAST RESORT: act first, ask only if stuck]"
+        elif n in ("bash", "read", "grep", "glob", "edit"):
+            note = " [USE THIS FIRST]"
         tool_desc.append(
-            '{name}: {desc}{params}'.format(
+            '{name}: {desc}{params}{note}'.format(
                 name=n, desc=desc,
-                params=(" — params: " + ", ".join("'{}'".format(p) for p in pnames)) if pnames else ""
+                params=(" — params: " + ", ".join("'{}'".format(p) for p in pnames)) if pnames else "",
+                note=note
             )
         )
     
     tool_format = (
-        "You are a coding agent. Call tools to complete every task. Never describe tools — act.\n\n"
+        "You are a coding agent. ALWAYS use bash/read/grep/glob/edit first.\n"
+        "question is ONLY for when you are genuinely stuck and must clarify.\n\n"
         "TOOLS:\n" + "\n".join(tool_desc) + "\n\n"
         "TO CALL A TOOL, output ONLY:\n"
         "```json\n"
