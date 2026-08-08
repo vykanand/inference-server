@@ -928,6 +928,11 @@ async def v1_chat_completions(request: Request):
         if was_truncated and eng.ready:
             eng.info["_truncated"] = True
             eng.info["_freed_tokens"] = freed
+        # Force low temperature when tools present. opencode sends ~0.7 which
+        # causes verbose descriptions instead of tool-calling. 0.1 is deterministic
+        # enough for reliable tool JSON without the degenerate repetition of 0.0.
+        if payload.get("tools") and payload.get("temperature", 0.7) > 0.2:
+            payload["temperature"] = 0.1
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
