@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import threading
 import time
+import asyncio
 
 import requests
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -23,6 +25,29 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 manager = EngineManager(BASE)
 manager.start_watchdog()
 app.mount("/static", StaticFiles(directory=WEB), name="static")
+
+VERSION = "2.2.0"
+_startup = time.time()
+
+# ── cancellation token for client-disconnect propagation ────────────────
+class CancellationToken:
+    def __init__(self):
+        self._evt = threading.Event()
+
+    def cancel(self):
+        self._evt.set()
+
+    @property
+    def is_cancelled(self):
+        return self._evt.is_set()
+
+# ── OpenAI-compliant error helpers ──────────────────────────────────────
+def _err(message, errtype="server_error", code=None, param=None, retryable=False):
+    return {"error": {"message": str(message), "type": errtype,
+                       "code": code or errtype, "param": param, "retryable": retryable}}
+
+def _sse_err(message, errtype="server_error"):
+    return "data: " + json.dumps(_err(message, errtype)) + "\n\n"
 
 
 def gguf_files():
@@ -315,7 +340,8 @@ def chat(port: int, body: dict):
     budget = max(512, ctx_limit - max_tokens)
     payload = {"messages": messages, "stream": True, "max_tokens": max_tokens}
     for k in ("temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty",
-              "frequency_penalty", "stop", "tools", "tool_choice", "parallel_tool_calls"):
+              "frequency_penalty", "stop", "tools", "tool_choice", "parallel_tool_calls",
+              "stream_options", "response_format", "seed", "logprobs", "top_logprobs", "n"):
         if body.get(k) is not None:
             payload[k] = body[k]
     if isinstance(messages, list) and messages:
@@ -373,6 +399,8 @@ CHAR_PER_TOKEN = 1.6
 def truncate_messages(messages, ctx_limit):
     """Drop oldest messages so the prompt fits within ctx_limit tokens.
 
+    Tool-interaction pairs (assistant tool_call + tool result) are dropped
+    as a unit to prevent orphaned result messages that confuse the model.
     Code-heavy prompts tokenize densely, so we use a conservative token
     estimate and reserve room for the completion. As a last resort we hard-cap
     each remaining message so total tokens stay under budget.
@@ -389,29 +417,63 @@ def truncate_messages(messages, ctx_limit):
             tc += len(str(fn.get("name") or "")) // CHAR_PER_TOKEN
         return max(tc, 1)
 
+    # Compute tool-interaction run boundaries: a run is an assistant message
+    # with tool_calls followed by zero or more `role:"tool"` results.
+    # When truncating we drop whole runs to keep pair integrity.
+    runs = []  # list of (start_idx, end_idx_inclusive)
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        role = m.get("role")
+        has_tc = bool(m.get("tool_calls"))
+        if role == "assistant" and has_tc:
+            j = i + 1
+            while j < len(messages) and messages[j].get("role") == "tool":
+                j += 1
+            runs.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+
+    # total tokens: sum of all
+    def run_toks(start, end):
+        return sum(_toks(messages[k]) for k in range(start, end + 1))
+
     total_toks = sum(_toks(m) for m in messages)
     if total_toks <= ctx_limit:
         return messages, False, 0
 
-    # Keep the first message if it is the system prompt; drop oldest after it.
-    # Never drop the last remaining message — if a single message is huge we
-    # hard-cap it below instead of sending an empty request.
+    # Build result list — keep system prompt, drop oldest runs/messages
     head = [messages[0]] if messages and messages[0].get("role") == "system" else []
-    tail = list(messages[1:] if head else messages)
+    tail = list(range(1 if head else 0, len(messages)))
     freed = 0
-    while len(tail) > 1 and (sum(_toks(m) for m in head) + sum(_toks(m) for m in tail)) > ctx_limit:
-        old = tail.pop(0)
-        freed += _toks(old)
 
-    result = head + tail
+    while tail and (sum(_toks(messages[k]) for k in tail) + (run_toks(0, 0) if head else 0)) > ctx_limit:
+        idx = tail.pop(0)
+        # If this message is part of a tool run, drop the whole run
+        run_found = None
+        for si, ei in runs:
+            if si <= idx <= ei:
+                run_found = (si, ei)
+                break
+        if run_found:
+            si, ei = run_found
+            # Remove all members of the run from tail
+            drop_set = set(range(si, ei + 1))
+            tail = [t for t in tail if t not in drop_set]
+            freed += run_toks(si, ei)
+        else:
+            freed += _toks(messages[idx])
+
+    result = head + [messages[k] for k in tail]
 
     # Last resort: even the minimal set may overflow (e.g. one giant file dump).
     # Hard-cap every message's characters so total tokens stay under budget.
     if sum(_toks(m) for m in result) > ctx_limit:
-        per = max(200, int(ctx_limit * CHAR_PER_TOKEN))
+        per = max(200, int(ctx_limit * CHAR_PER_TOKEN) // max(len(result), 1))
         new_result = []
         for m in result:
-            m = dict(m)  # shallow copy so we don't mutate caller state
+            m = dict(m)
             c = m.get("content")
             if isinstance(c, str) and len(c) > per:
                 m["content"] = c[:per] + "\n...[context truncated to fit window]"
@@ -517,44 +579,58 @@ def _parse_tool_call_obj(obj, tools):
     return _canonicalize_tool_name(name, tools), args
 
 
-def _extract_tool_call(content, tools=None):
-    """If `content` is a JSON tool-call (fenced OR bare), return
-    (canonical_name, args_dict). Handles the shapes local models emit:
-    {"name":..,"arguments":..}, {"tool_calls":[..]}, or a bare JSON array."""
+def _extract_tool_calls(content, tools=None):
+    """Extract ALL tool calls from fenced or bare JSON text.
+    Handles single-object, array, and nested {"tool_calls":[...]} shapes."""
     if not isinstance(content, str):
-        return None
+        return []
     text = content.strip()
+    if not text:
+        return []
     m = _TOOL_FENCE_RE.match(text)
     src = m.group(1) if m else text
     if not m:
-        if not (text.startswith("{") and '"name"' in text):
-            return None
+        if not (text.startswith("{") and '"name"' in text) and not (text.startswith("[") and '"name"' in text):
+            return []
     try:
         obj = json.loads(src)
     except Exception:
-        return None
+        return []
     # Unwrap common wrappers
-    if isinstance(obj, list) and obj:
-        obj = obj[0]
-    if isinstance(obj, dict) and "tool_calls" in obj and isinstance(obj["tool_calls"], list) and obj["tool_calls"]:
-        obj = obj["tool_calls"][0].get("function", obj["tool_calls"][0])
-    return _parse_tool_call_obj(obj, tools)
+    if isinstance(obj, dict) and "tool_calls" in obj and isinstance(obj.get("tool_calls"), list):
+        obj = obj["tool_calls"]
+    if isinstance(obj, dict):
+        tc = _parse_tool_call_obj(obj, tools)
+        return [tc] if tc else []
+    if isinstance(obj, list):
+        out = []
+        for item in obj:
+            if isinstance(item, dict) and "function" in item and isinstance(item.get("function"), dict):
+                item = item["function"]
+            tc = _parse_tool_call_obj(item, tools)
+            if tc:
+                out.append(tc)
+        return out
+    return []
 
 
 def _split_tool_and_text(full, tools):
-    """Split a response into (text_before, tool_call_or_None, text_after).
-    Lets us correctly emit a tool call even when the model wraps it in
-    explanatory text (the text<->tool switching case). Returns None when no
-    tool call is present (caller should treat the whole thing as text)."""
+    """Split response into (text_before, [(name,args),...], text_after).
+    Returns None when no tool calls are present."""
     m = _FENCE_BLOCK_RE.search(full)
     if not m:
+        # Also try bare JSON at the end
+        tcs = _extract_tool_calls(full.strip(), tools)
+        if tcs:
+            # Full response is the tool call(s), no text before
+            return "", tcs, ""
         return None
     before = full[:m.start()].strip()
     after = full[m.end():].strip()
-    tc = _extract_tool_call(m.group(1), tools)
-    if not tc:
+    tcs = _extract_tool_calls(m.group(1), tools)
+    if not tcs:
         return None
-    return before, tc, after
+    return before, tcs, after
 
 
 def _looks_like_tool_call(text):
@@ -646,10 +722,15 @@ def _has_tool_messages(messages):
                (m.get("role") == "assistant" and m.get("tool_calls")) for m in messages)
 
 
-def _wrap_tool_call(name, args, call_id=None):
-    call_id = call_id or "call_%d" % int(time.time() * 1000)
-    return [{"id": call_id, "type": "function",
-             "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}]
+def _wrap_tool_calls(tcs, call_id=None):
+    """Wrap a list of (name, args) tuples into OpenAI tool_call deltas."""
+    out = []
+    base_id = call_id or "call_%d" % int(time.time() * 1000)
+    for i, (name, args) in enumerate(tcs):
+        cid = "%s_%d" % (base_id, i) if len(tcs) > 1 else base_id
+        out.append({"id": cid, "type": "function",
+                     "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    return out
 
 
 def _sse_chunk(content=None, tool_calls=None, finish=None):
@@ -676,11 +757,10 @@ def _convert_tool_text(obj, tools=None):
         if msg.get("tool_calls"):  # already native — leave untouched
             return obj
         content = msg.get("content") or ""
-        tc = _extract_tool_call(content, tools)
-        if not tc:
+        tcs = _extract_tool_calls(content, tools)
+        if not tcs:
             return obj
-        name, args = tc
-        msg["tool_calls"] = _wrap_tool_call(name, args)
+        msg["tool_calls"] = _wrap_tool_calls(tcs)
         msg["content"] = ""
         choices[0]["finish_reason"] = "tool_calls"
         obj["choices"] = choices
@@ -713,13 +793,26 @@ async def v1_chat_completions(request: Request):
     model_req = body.get("model") or "local"
     eng = await run_in_threadpool(_ensure_engine, model_req)
     if not eng or not eng.running:
-        return JSONResponse(status_code=503, content={
-            "error": {"message": "No local model is loaded and no .gguf model found to auto-load. "
-                                 "Load a model via the UI (/api/engines/load) or set DEFAULT_MODEL.",
-                      "type": "no_model_loaded"}})
+        return JSONResponse(status_code=503, content=_err(
+            "No local model is loaded and no .gguf model found to auto-load. "
+            "Load a model via the UI (/api/engines/load) or set DEFAULT_MODEL.",
+            "no_model_loaded"))
     target = f"http://127.0.0.1:{eng.port}/v1/chat/completions"
     payload = dict(body)
     want_stream = bool(payload.get("stream", False))
+
+    # Client-disconnect cancellation hook
+    ct = CancellationToken()
+    async def _watch_disconnect():
+        try:
+            while not ct.is_cancelled:
+                if await request.is_disconnected():
+                    ct.cancel()
+                    return
+                await asyncio.sleep(0.5)
+        except Exception:
+            pass
+    _ = asyncio.ensure_future(_watch_disconnect())
 
     # --- Context-aware message truncation (fixes "exceeds available context size") ---
     # Reserve room for the completion so we never overflow ctx on the reply either.
@@ -748,16 +841,22 @@ async def v1_chat_completions(request: Request):
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
         tools = payload.get("tools")
-        buf = []          # accumulated content for text→tool conversion
+        buf = []
         saw_native = False
         saw_finish = None
         try:
             with requests.post(target, json=payload, stream=True, timeout=600) as r:
                 if r.status_code != 200:
-                    err_msg = json.dumps({"error": {"message": "llama-server %s: %s" % (r.status_code, r.text[:500])}})
-                    yield "data: " + err_msg + "\n\n"
+                    yield _sse_err("llama-server %s: %s" % (r.status_code, r.text[:500]),
+                                   "upstream_error" if r.status_code >= 500 else "invalid_request_error")
+                    yield "data: [DONE]\n\n"
                     return
                 for raw in r.iter_lines(decode_unicode=True):
+                    if ct.is_cancelled:
+                        r.close()
+                        yield _sse_err("client disconnected, upstream cancelled", "cancelled")
+                        yield "data: [DONE]\n\n"
+                        return
                     if not raw:
                         continue
                     if not raw.startswith("data:"):
@@ -769,8 +868,8 @@ async def v1_chat_completions(request: Request):
                     try:
                         obj = json.loads(d)
                     except Exception:
-                        safe = json.dumps({"error": {"message": str(raw)[:500]}})
-                        yield "data: " + safe + "\n\n"
+                        yield _sse_err("invalid JSON from upstream: %s" % str(raw)[:300],
+                                       "invalid_response_error")
                         continue
                     if isinstance(obj, dict) and obj.get("model"):
                         obj["model"] = model_req
@@ -781,10 +880,8 @@ async def v1_chat_completions(request: Request):
 
                     # ── tools path ───────────────────────────────────────
                     delta = (obj.get("choices") or [{}])[0].get("delta") or {}
-                    # Native tool_calls: flush any buffered text, then relay live
                     if delta.get("tool_calls"):
                         if buf and not saw_native:
-                            # flush accumulated text before native tool_calls kick in
                             yield _sse_chunk(content="".join(buf))
                             buf = []
                         saw_native = True
@@ -807,16 +904,15 @@ async def v1_chat_completions(request: Request):
                     if full:
                         seg = _split_tool_and_text(full, tools)
                         if seg:
-                            before, tc, after = seg
+                            before, tcs, after = seg
                             if before:
                                 yield _sse_chunk(content=before)
-                            if tc:
-                                name, args = tc
-                                yield _sse_chunk(tool_calls=_wrap_tool_call(name, args))
+                            if tcs:
+                                yield _sse_chunk(tool_calls=_wrap_tool_calls(tcs))
                                 yield _sse_chunk(finish="tool_calls")
                             if after:
                                 yield _sse_chunk(content=after, finish="stop")
-                            elif not tc:
+                            elif not tcs:
                                 yield _sse_chunk(finish="stop")
                         else:
                             yield _sse_chunk(content=full, finish="stop")
@@ -829,8 +925,7 @@ async def v1_chat_completions(request: Request):
                     if not saw_finish:
                         yield _sse_chunk(finish="stop")
         except Exception as e:
-            safe_err = json.dumps({"error": {"message": str(e)}})
-            yield "data: " + safe_err + "\n\n"
+            yield _sse_err(str(e), "server_error")
         yield "data: [DONE]\n\n"
 
     if want_stream:
@@ -1154,6 +1249,16 @@ def _extract_code_blocks(text):
         cleaned = re.sub(r"^```\w*\s*|\s*```$", "", text.strip())
         blocks = [cleaned] if cleaned else []
     return blocks
+
+
+@app.get("/health")
+@app.get("/ready")
+def health():
+    return {"status": "ok", "version": VERSION, "uptime_s": round(time.time() - _startup, 1)}
+
+@app.get("/version")
+def version():
+    return {"version": VERSION, "backend": "llama.cpp", "api": "OpenAI-compatible /v1"}
 
 
 @app.get("/api/status")
