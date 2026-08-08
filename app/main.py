@@ -413,6 +413,25 @@ def _escape_json(s):
 CHAR_PER_TOKEN = 1.6
 
 
+def _sanitize_content(text):
+    """Strip control/non-printable characters the model sometimes emits at
+    high temperature or with corrupted context. Preserves newlines, tabs,
+    and all printable Unicode. Also strips the Unicode replacement char."""
+    if not isinstance(text, str):
+        return text
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        if cp == 0xFFFD:   # replacement char — drop
+            continue
+        if cp < 0x20 and cp not in (9, 10, 13):  # control (keep \t \n \r)
+            continue
+        if 0x7F <= cp < 0xA0:  # DEL + C1 controls
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def truncate_messages(messages, ctx_limit):
     """Drop oldest messages so the prompt fits within ctx_limit tokens.
 
@@ -553,6 +572,14 @@ def _proxy_completion(target, payload, model_req):
     # expect OpenAI tool_calls get a properly structured call.
     if payload.get("tools") and isinstance(obj, dict):
         obj = _convert_tool_text(obj, payload.get("tools"))
+    # Sanitize model output — strip control/illegal characters from content
+    if isinstance(obj, dict):
+        for choice in (obj.get("choices") or []):
+            msg = choice.get("message") or {}
+            if not msg.get("tool_calls"):
+                c = msg.get("content")
+                if isinstance(c, str):
+                    msg["content"] = _sanitize_content(c)
     return r.status_code, obj
 
 
@@ -851,7 +878,7 @@ def _sse_chunk(content=None, tool_calls=None, finish=None):
     """OpenAI-compliant streaming chunk: finish_reason at CHOICE level, not inside delta."""
     d = {}
     if content is not None:
-        d["content"] = content
+        d["content"] = _sanitize_content(content)
     if tool_calls is not None:
         d["tool_calls"] = tool_calls
     choice = {"index": 0, "delta": d}
@@ -1042,6 +1069,7 @@ async def v1_chat_completions(request: Request):
                                     dc = (obj.get("choices") or [{}])[0].get("delta") or {}
                                     c = dc.get("content")
                                     if c:
+                                        c = _sanitize_content(c)
                                         content_chars += len(c)
                                         buf.append(c)
                                     fr = dc.get("finish_reason")
@@ -1065,13 +1093,22 @@ async def v1_chat_completions(request: Request):
                                     yield _sse_chunk(content="".join(buf))
                                     buf.clear()
                                 saw_native = True
+                                # Sanitize content in native tool_call chunks
+                                for tc in (delta.get("tool_calls") or []):
+                                    fn = tc.get("function") or {}
+                                    a = fn.get("arguments")
+                                    if isinstance(a, str):
+                                        fn["arguments"] = _sanitize_content(a)
                                 content_chars += len(json.dumps(obj))
                                 yield "data: " + json.dumps(obj) + "\n\n"
                                 continue
                             c = delta.get("content")
                             if c:
+                                c = _sanitize_content(c)
                                 content_chars += len(c)
                                 if saw_native:
+                                    # Re-update obj with sanitized content
+                                    (obj.get("choices") or [{}])[0].get("delta", {})["content"] = c
                                     yield "data: " + json.dumps(obj) + "\n\n"
                                 else:
                                     buf.append(c)
