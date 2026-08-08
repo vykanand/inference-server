@@ -118,7 +118,7 @@ def auto_tune(hw, file_size_mb, layers=None, ctx_limit=None):
         max_ctx = 8192
     if ctx_limit:
         max_ctx = min(max_ctx, ctx_limit)
-    ctx = max(512, (max_ctx // 256) * 256)
+    ctx = max(16384, (max_ctx // 256) * 256)
     p["ctx"] = ctx
 
     # --- batch / threads tuned for GPUs (bigger is faster on CUDA) ---

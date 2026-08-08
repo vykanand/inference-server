@@ -956,6 +956,19 @@ def v1_models():
     return {"object": "list", "data": data}
 
 
+def _est_toks(m):
+    """Conservative token estimate: char/1.5 for code, accounts for tool args."""
+    if not isinstance(m, dict):
+        return 0
+    c = m.get("content") or ""
+    n = len(str(c))
+    for tc in (m.get("tool_calls") or []):
+        fn = tc.get("function") or {}
+        n += len(str(fn.get("arguments") or ""))
+        n += len(str(fn.get("name") or ""))
+    return max(1, int(n / 1.5))
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def v1_chat_completions(request: Request):
@@ -998,11 +1011,9 @@ async def v1_chat_completions(request: Request):
     messages = payload.get("messages")
     if isinstance(messages, list) and messages:
         # Normalize tool_calls/tool-results to text (llama-server compatibility).
-        # This is the ONLY message transformation — no truncation, no dropping.
         if _has_tool_messages(messages):
             messages = _normalize_messages(messages)
-        # Minimal hint: prepend tool format instruction for models without
-        # chat templates. Essential — without it, tool calling is impossible.
+        # Prepend tool format instruction
         if payload.get("tools") and _tool_names(payload["tools"]):
             idx = None
             for i in range(len(messages)):
@@ -1010,19 +1021,16 @@ async def v1_chat_completions(request: Request):
                     idx = i
                     break
             names = _tool_names(payload["tools"])
-            # Build project-context prefix (OS, dir, git status, languages)
+            project_ctx = ""
             try:
                 pc_parts = ["CWD: %s" % os.getcwd(), "OS: Windows"]
                 import glob
                 py_files = len(glob.glob("**/*.py", recursive=True))
-                js_files = len(glob.glob("**/*.{js,ts,tsx,jsx}", recursive=True))
                 if py_files: pc_parts.append("Python files: %d" % py_files)
-                if js_files: pc_parts.append("JS/TS files: %d" % js_files)
-                gf = ".git" if os.path.isdir(".git") else None
-                if gf: pc_parts.append("Git repo: yes")
+                if os.path.isdir(".git"): pc_parts.append("Git repo: yes")
                 project_ctx = "ENV: " + " | ".join(pc_parts) + "\n"
             except Exception:
-                project_ctx = ""
+                pass
             tool_hint = (
                 project_ctx +
                 "You have tools. ALWAYS call them to act — never ask the user to do anything.\n"
@@ -1038,8 +1046,26 @@ async def v1_chat_completions(request: Request):
             else:
                 messages.insert(0, {"role": "system", "content": tool_hint.strip()})
         payload["messages"] = messages
-        # NO preemptive truncation — the full conversation reaches the model.
-        # Truncation only happens as a fallback if llama-server returns 400.
+        # Preemptive truncation: ensure prompt fits before sending. Uses 80% of
+        # ctx so there's always headroom. Preserves system + most recent turns.
+        budget = int(ctx_limit * 0.85)
+        messages = payload["messages"]
+        est = sum(_est_toks(m) for m in messages)
+        if est > budget:
+            # Keep system + last N messages that fit within budget
+            sysmsg = [messages[0]] if messages and messages[0].get("role") == "system" else []
+            rest = messages[1:] if sysmsg else list(messages)
+            kept = []
+            total = 0
+            for m in reversed(rest):
+                t = _est_toks(m)
+                if total + t > budget - (2 if sysmsg else 0):
+                    break
+                kept.insert(0, m)
+                total += t
+            payload["messages"] = sysmsg + kept
+            _log("truncate", before=len(messages), after=len(payload["messages"]),
+                 est_tokens=est, budget=budget)
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
@@ -1063,9 +1089,11 @@ async def v1_chat_completions(request: Request):
                                 if isinstance(msgs, list) and len(msgs) > 2:
                                     sysmsg = [msgs[0]] if msgs and msgs[0].get("role") == "system" else []
                                     rest = msgs[1:] if sysmsg else msgs
-                                    # Keep system + last 6 turns to stop context growth
-                                    keep = max(1, min(len(rest), 6))
+                                    # Aggressive fallback: system + last 4 messages
+                                    keep = max(1, min(len(rest), 4))
                                     payload["messages"] = sysmsg + rest[-keep:]
+                                    _log("truncate", before=len(msgs), after=len(payload["messages"]),
+                                         reason="ctx_400")
                                     _log("truncate", kept=len(payload["messages"]), reason="ctx_400")
                                     continue
                             yield _sse_err("llama-server %s: %s" % (r.status_code, err_text),
