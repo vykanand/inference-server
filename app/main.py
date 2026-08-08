@@ -1036,6 +1036,7 @@ async def v1_chat_completions(request: Request):
         saw_finish = None
         chunk_count = 0
         content_chars = 0
+        live_emit = True   # progressive streaming on; off when tool-call fence detected
         try:
             for attempt in (0, 1):
                 buf.clear(); saw_native = False; saw_finish = None
@@ -1121,14 +1122,21 @@ async def v1_chat_completions(request: Request):
                                 c = _sanitize_content(c)
                                 content_chars += len(c)
                                 buf.append(c)
-                                # Progressive streaming: emit content live for
-                                # word-by-word display. Buffer maintained for
-                                # end-of-stream tool-call detection.
                                 if saw_native:
                                     (obj.get("choices") or [{}])[0].get("delta", {})["content"] = c
                                     yield "data: " + json.dumps(obj) + "\n\n"
-                                else:
-                                    yield _sse_chunk(content=c)
+                                elif live_emit:
+                                    # Progressive streaming: emit content live unless
+                                    # a tool-call fence pattern is detected. Once a
+                                    # fence starts, switch to full buffering so the
+                                    # raw JSON isn't emitted as text (avoids duplicate
+                                    # content + tool_calls in the client).
+                                    trailing = "".join(buf)[-120:]
+                                    if "```json" in trailing or '```' in trailing[-10:]:
+                                        live_emit = False
+                                    else:
+                                        yield _sse_chunk(content=c)
+                                # else: already in buffering mode — accumulate only
                             fr = delta.get("finish_reason")
                             if fr:
                                 saw_finish = fr
