@@ -988,8 +988,14 @@ async def v1_chat_completions(request: Request):
         # Truncation only happens as a fallback if llama-server returns 400.
 
     def _stream_gen():
+        _log("forward", model=model_req, port=eng.port,
+             msgs=len(payload.get("messages") or []),
+             tools=len(payload.get("tools") or []),
+             max_tokens=payload.get("max_tokens"))
         has_tools = bool(payload.get("tools"))
         tools = payload.get("tools")
+        result = {"content_len": 0}
+        was_truncated = False
         for attempt in (0, 1):
             buf = []
             saw_native = False
@@ -1013,14 +1019,42 @@ async def v1_chat_completions(request: Request):
                         yield "data: [DONE]\n\n"
                         _log("response", model=model_req, error=True, status=r.status_code)
                         return
-                for raw in r.iter_lines(decode_unicode=True):
-                    if ct.is_cancelled:
-                        r.close()
-                        yield _sse_err("client disconnected, upstream cancelled", "cancelled")
-                        yield "data: [DONE]\n\n"
-                        return
-                    if not raw:
-                        continue
+                    for raw in r.iter_lines(decode_unicode=True):
+                        if ct.is_cancelled:
+                            r.close()
+                            yield _sse_err("client disconnected", "cancelled")
+                            yield "data: [DONE]\n\n"
+                            return
+                        if not raw:
+                            continue
+                        if not raw.startswith("data:"):
+                            yield raw + "\n\n"
+                            continue
+                        d = raw[5:].strip()
+                        if d == "[DONE]":
+                            continue
+                        if not has_tools:
+                            result["content_len"] += len(raw)
+                            yield raw + "\n\n"
+                            continue
+                        try:
+                            obj = json.loads(d)
+                        except Exception:
+                            yield _sse_err("invalid JSON from upstream: %s" % str(raw)[:300],
+                                           "invalid_response_error")
+                            continue
+                        if isinstance(obj, dict) and obj.get("model"):
+                            obj["model"] = model_req
+
+                        # ── tools path ───────────────────────────────────────
+                        delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+                        if delta.get("tool_calls"):
+                            if buf and not saw_native:
+                                yield _sse_chunk(content="".join(buf))
+                                buf = []
+                            saw_native = True
+                            yield "data: " + json.dumps(obj) + "\n\n"
+                            continue
                     if not raw.startswith("data:"):
                         yield raw + "\n\n"
                         continue
@@ -1037,8 +1071,7 @@ async def v1_chat_completions(request: Request):
                         obj["model"] = model_req
 
                     if not has_tools:
-                        result["content_len"] += len(json.dumps(obj))
-                        yield "data: " + json.dumps(obj) + "\n\n"
+                        yield raw + "\n\n"
                         continue
 
                     # ── tools path ───────────────────────────────────────
