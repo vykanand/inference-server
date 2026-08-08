@@ -29,6 +29,18 @@ app.mount("/static", StaticFiles(directory=WEB), name="static")
 VERSION = "2.2.0"
 _startup = time.time()
 
+# ── lightweight inference log (opencode ↔ server) ──────────────────────
+_inf_log = []
+_log_lock = threading.Lock()
+
+def _log(tag, **kw):
+    entry = {"ts": time.time(), "tag": tag}
+    entry.update(kw)
+    with _log_lock:
+        _inf_log.append(entry)
+        if len(_inf_log) > 200:
+            _inf_log[:] = _inf_log[-150:]
+
 # ── cancellation token for client-disconnect propagation ────────────────
 class CancellationToken:
     def __init__(self):
@@ -805,7 +817,12 @@ def _normalize_messages(messages):
             tcid = m.get("tool_call_id")
             name = id_name.get(tcid, "")
             content = m.get("content") or ""
-            prefix = "Here is the result of your %s call. Now answer the user's question:\n" % name if name else "Here is the tool result:\n"
+            # Distinguish success from error — model needs to know when a tool call failed
+            is_error = any(w in str(content).lower()[:200] for w in ("error", "invalid", "failed", "cannot", "denied"))
+            if is_error:
+                prefix = "ERROR: your %s call failed: " % name if name else "ERROR: your tool call failed: "
+            else:
+                prefix = "Result of %s: " % name if name else "Result: "
             out.append({"role": "user", "content": prefix + content})
         else:
             out.append(m)
@@ -873,10 +890,28 @@ def v1_models():
     data = []
     for e in manager.list():
         if e.get("running"):
-            data.append({"id": e.get("model_name") or "local", "object": "model",
-                         "created": 0, "owned_by": "local", "port": e.get("port")})
+            ctx = e.get("params", {}).get("ctx", 4096)
+            data.append({
+                "id": e.get("model_name") or "local",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "local",
+                "port": e.get("port"),
+                "context_length": ctx,
+                "max_output_tokens": ctx,
+                "capabilities": {
+                    "tool_calling": True,
+                    "streaming": True,
+                    "reasoning": False,
+                    "structured_output": False,
+                    "vision": False,
+                    "prompt_caching": False,
+                },
+            })
     if not data:
-        data.append({"id": "local", "object": "model", "created": 0, "owned_by": "local"})
+        data.append({"id": "local", "object": "model", "created": 0, "owned_by": "local",
+                       "context_length": 0, "max_output_tokens": 0,
+                       "capabilities": {"tool_calling": False, "streaming": True, "reasoning": False}})
     return {"object": "list", "data": data}
 
 
@@ -891,6 +926,8 @@ async def v1_chat_completions(request: Request):
         body = {}
     model_req = body.get("model") or "local"
     eng = await run_in_threadpool(_ensure_engine, model_req)
+    _log("request", model=model_req, msgs=len(body.get("messages") or []),
+         tools=len(body.get("tools") or []), stream=bool(body.get("stream")))
     if not eng or not eng.running:
         return JSONResponse(status_code=503, content=_err(
             "No local model is loaded and no .gguf model found to auto-load. "
@@ -1073,6 +1110,7 @@ async def v1_chat_completions(request: Request):
             except Exception as e:
                 yield _sse_err(str(e), "server_error")
         yield "data: [DONE]\n\n"
+        _log("response", model=model_req, tool_calls=saw_native, has_tools=has_tools)
 
     if want_stream:
         return StreamingResponse(_stream_gen(), media_type="text/event-stream",
@@ -1405,6 +1443,14 @@ def health():
 @app.get("/version")
 def version():
     return {"version": VERSION, "backend": "llama.cpp", "api": "OpenAI-compatible /v1"}
+
+
+@app.get("/api/log")
+def inference_log(n: int = Query(50, ge=1, le=200)):
+    """Last N inference request/response log entries (opencode ↔ server)."""
+    with _log_lock:
+        tail = _inf_log[-n:]
+    return {"log": tail, "total": len(_inf_log)}
 
 
 @app.get("/api/status")
