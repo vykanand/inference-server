@@ -1207,10 +1207,15 @@ async def v1_chat_completions(request: Request):
 
     if want_stream:
         return StreamingResponse(_stream_gen(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                                           "X-Context-Limit": str(ctx_limit),
+                                           "X-Context-Type": "openai-chat",
+                                           "X-Model": eng.model_name or "local"})
 
     status, obj = await run_in_threadpool(_proxy_completion, target, payload, model_req)
-    return JSONResponse(status_code=status, content=obj)
+    return JSONResponse(status_code=status, content=obj,
+                        headers={"X-Context-Limit": str(ctx_limit),
+                                  "X-Model": eng.model_name or "local"})
 
 
 @app.post("/api/config-chat")
