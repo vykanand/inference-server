@@ -864,11 +864,15 @@ def _has_tool_messages(messages):
 
 
 def _wrap_tool_calls(tcs, call_id=None):
-    """Wrap a list of (name, args) tuples into OpenAI tool_call deltas."""
+    """Wrap a list of (name, args) tuples into OpenAI tool_call deltas.
+    Strips null values from args dict — models often include null for
+    optional params, which fails schema validation on the client side."""
     out = []
     base_id = call_id or "call_%d" % int(time.time() * 1000)
     for i, (name, args) in enumerate(tcs):
         cid = "%s_%d" % (base_id, i) if len(tcs) > 1 else base_id
+        if isinstance(args, dict):
+            args = {k: v for k, v in args.items() if v is not None}
         out.append({"id": cid, "type": "function",
                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
     return out
@@ -1109,12 +1113,20 @@ async def v1_chat_completions(request: Request):
                                     yield _sse_chunk(content="".join(buf))
                                     buf.clear()
                                 saw_native = True
-                                # Sanitize content in native tool_call chunks
+                                # Sanitize content in native tool_call chunks + strip null args
                                 for tc in (delta.get("tool_calls") or []):
                                     fn = tc.get("function") or {}
                                     a = fn.get("arguments")
                                     if isinstance(a, str):
                                         fn["arguments"] = _sanitize_content(a)
+                                    # Strip null values from parsed args to avoid schema errors
+                                    try:
+                                        parsed = json.loads(fn.get("arguments", "{}"))
+                                        if isinstance(parsed, dict):
+                                            parsed = {k: v for k, v in parsed.items() if v is not None}
+                                            fn["arguments"] = json.dumps(parsed, ensure_ascii=False)
+                                    except Exception:
+                                        pass
                                 content_chars += len(json.dumps(obj))
                                 yield "data: " + json.dumps(obj) + "\n\n"
                                 continue
