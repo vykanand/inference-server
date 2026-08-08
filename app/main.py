@@ -708,23 +708,31 @@ def _split_tool_and_text(full, tools):
             segments.append(("tools", tcs))
             pos = m.end()
     if not segments:
-        # Also try bare JSON at the end
+        # No fenced blocks — try bare JSON at the end
         tcs = _extract_tool_calls(full.strip(), tools)
         if tcs:
             return "", tcs, ""
+        # Also try last `{...}` as inline JSON
+        last_brace = full.rfind('{"name"')
+        if last_brace != -1:
+            tail = full[last_brace:].strip()
+            tcs = _extract_tool_calls(tail, tools)
+            if tcs:
+                return full[:last_brace].strip(), tcs, ""
         return None
-    # Flatten: first text segment + all tool calls + trailing text
+    # Flatten: text segments + all tool calls + trailing text
     after = full[pos:].strip()
-    first_text = ""
+    text_parts = []
     all_tcs = []
     for seg in segments:
         if seg is None:
             continue
         kind, val = seg
-        if kind == "text" and not first_text:
-            first_text = val
+        if kind == "text":
+            text_parts.append(val)
         elif kind == "tools":
             all_tcs.extend(val)
+    first_text = " ".join(text_parts)
     return first_text, all_tcs, after
 
 
@@ -1079,7 +1087,7 @@ async def v1_chat_completions(request: Request):
         live_emit = True   # progressive streaming on; off when tool-call fence detected
         try:
             for attempt in (0, 1):
-                buf.clear(); saw_native = False; saw_finish = None
+                buf.clear(); saw_native = False; saw_finish = None; live_emit = True
                 try:
                     with requests.post(target, json=payload, stream=True, timeout=600) as r:
                         if r.status_code != 200:
@@ -1130,7 +1138,7 @@ async def v1_chat_completions(request: Request):
                                         c = _sanitize_content(c)
                                         content_chars += len(c)
                                         buf.append(c)
-                                    fr = dc.get("finish_reason")
+                                    fr = (obj.get("choices") or [{}])[0].get("finish_reason")
                                     if fr:
                                         saw_finish = fr
                                 except Exception:
@@ -1151,20 +1159,12 @@ async def v1_chat_completions(request: Request):
                                     yield _sse_chunk(content="".join(buf))
                                     buf.clear()
                                 saw_native = True
-                                # Sanitize content in native tool_call chunks + strip null args
+                                # Sanitize args in native tool_call chunks
                                 for tc in (delta.get("tool_calls") or []):
                                     fn = tc.get("function") or {}
                                     a = fn.get("arguments")
                                     if isinstance(a, str):
                                         fn["arguments"] = _sanitize_content(a)
-                                    # Strip null values from parsed args to avoid schema errors
-                                    try:
-                                        parsed = json.loads(fn.get("arguments", "{}"))
-                                        if isinstance(parsed, dict):
-                                            parsed = {k: v for k, v in parsed.items() if v is not None}
-                                            fn["arguments"] = json.dumps(parsed, ensure_ascii=False)
-                                    except Exception:
-                                        pass
                                 content_chars += len(json.dumps(obj))
                                 yield "data: " + json.dumps(obj) + "\n\n"
                                 continue
@@ -1183,7 +1183,7 @@ async def v1_chat_completions(request: Request):
                                     else:
                                         yield _sse_chunk(content=c)
                                 # else: already in buffering mode — accumulate only
-                            fr = delta.get("finish_reason")
+                                fr = (obj.get("choices") or [{}])[0].get("finish_reason")
                             if fr:
                                 saw_finish = fr
 
@@ -1216,11 +1216,11 @@ async def v1_chat_completions(request: Request):
                                         if not saw_finish:
                                             yield _sse_chunk(finish="stop")
                                 else:
-                                    # No tool call detected. If live emission was
-                                    # stopped (false fence), emit ONLY finish.
-                                    # Content was already live-emitted progressively.
-                                    if not live_emit and not saw_finish:
-                                        yield _sse_chunk(finish="stop")
+                                    # No tool call found but live emission was stopped
+                                    # (false fence). Emit buffered content so text is
+                                    # not silently dropped.
+                                    if not live_emit:
+                                        yield _sse_chunk(content="".join(buf), finish="stop")
                                     elif not saw_finish:
                                         yield _sse_chunk(finish="stop")
                             else:
