@@ -379,11 +379,19 @@ def _default_model_path():
                 return f
     for f in found:
         low = f.lower()
-        if "coder" in low and "instruct" in low:
-            return f  # Qwen2.5-Coder, DeepSeek-Coder — best for tool calling
+        if "phi" in low and "instruct" in low and "mini" in low:
+            return f  # Phi-4-mini: best multi-turn tool calling on 4 GB
     for f in found:
         low = f.lower()
-        if "coder" in low or "instruct" in low:
+        if "phi" in low and "instruct" in low:
+            return f
+    for f in found:
+        low = f.lower()
+        if "coder" in low and "instruct" in low:
+            return f  # Qwen2.5-Coder: good code, weaker multi-turn
+    for f in found:
+        low = f.lower()
+        if "instruct" in low:
             return f
     return sorted(found, key=os.path.getsize)[0]
 
@@ -583,9 +591,40 @@ def _parse_tool_call_obj(obj, tools):
     return _canonicalize_tool_name(name, tools), args
 
 
+def _repair_json(text):
+    """Repair truncated JSON from models that miss closing braces/brackets.
+    E.g. `{"name":"x","arguments":{"k":"v"}` → add missing `}}`."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = t[3:].strip()
+        if t.endswith("```"):
+            t = t[:-3].strip()
+    for _ in range(8):
+        try:
+            return json.loads(t)
+        except Exception:
+            pass
+        # Try adding closing characters
+        last = t[-1] if t else ""
+        if last in ("}", "]"):
+            # Already closed — try adding comma-like closings
+            # This handles `{"a":1}{"b":2` → `{"a":1},{"b":2}`
+            # But the simpler case: just add more closing braces
+            pass
+        # Count open/close
+        opens = t.count("{") + t.count("[")
+        closes = t.count("}") + t.count("]")
+        if opens > closes:
+            t += "}" * (opens - closes)
+        else:
+            t += "}"
+    return None
+
+
 def _extract_tool_calls(content, tools=None):
     """Extract ALL tool calls from fenced or bare JSON text.
-    Handles single-object, array, and nested {"tool_calls":[...]} shapes."""
+    Handles single-object, array, and nested {"tool_calls":[...]} shapes.
+    Includes JSON repair for models that miss closing braces (Phi-mini)."""
     if not isinstance(content, str):
         return []
     text = content.strip()
@@ -596,10 +635,13 @@ def _extract_tool_calls(content, tools=None):
     if not m:
         if not (text.startswith("{") and '"name"' in text) and not (text.startswith("[") and '"name"' in text):
             return []
+    # Try strict parse, then repair if broken JSON (common on Phi/1-4B models)
     try:
         obj = json.loads(src)
     except Exception:
-        return []
+        obj = _repair_json(src)
+        if obj is None:
+            return []
     # Unwrap common wrappers
     if isinstance(obj, dict) and "tool_calls" in obj and isinstance(obj.get("tool_calls"), list):
         obj = obj["tool_calls"]
@@ -649,18 +691,28 @@ def _looks_like_tool_call(text):
 
 
 def _augment_tool_system(messages, tools):
-    """Prepend a SHORT tool-format primer so non-native-tool GGUFs understand
-    they should emit fenced JSON. Uses encouraging (not restrictive) language
-    to prevent safety-refusal on small models (Phi-4, Qwen 1-3B)."""
+    """Prepend tool-format primer + append result-processing hint when tool
+    results are already present in the conversation. Handles both tasks
+    independently for safe multi-turn idempotency."""
     names = _tool_names(tools)[:20]
-    tool_format = (
-        "You can call tools using:\n"
-        "```json\n"
-        '{"name":"tool","arguments":{}}\n'
-        "```\n"
-        "Available: " + ", ".join(names) + "\n\n"
+    has_results = any(
+        m.get("content") and ("Here is the result" in str(m.get("content", ""))[:80] or
+                               "[Result of" in str(m.get("content", ""))[:60])
+        for m in messages
     )
+    tool_format = (
+        "You have tools: " + ", ".join(names) + ". Use them by outputting:\n"
+        "```json\n"
+        '{"name":"<tool>","arguments":{"<key>":"<value>"}}\n'
+        "```\n"
+    )
+    if has_results:
+        tool_format += "Tool results are present below. Answer using them — do not call more tools.\n\n"
+    else:
+        tool_format += "After calling a tool, you will see its result. Use that to answer.\n\n"
+
     msgs = list(messages)
+    # Find the system message to modify
     idx = None
     for i in range(len(msgs)):
         if msgs[i].get("role") == "system":
@@ -669,8 +721,14 @@ def _augment_tool_system(messages, tools):
     if idx is not None:
         m = dict(msgs[idx])
         c = m.get("content") or ""
-        if "You can call tools using" not in c and "TOOL USE FORMAT" not in c:
+        already_known = ("You have tools:" in c or "Tools available:" in c or
+                         "TOOL USE FORMAT" in c or "You can call tools" in c)
+        if not already_known:
             m["content"] = tool_format + c
+        elif has_results and "Tool results are present" not in c:
+            # Already has tool format from a previous turn, but this turn
+            # has fresh results — append the hint
+            m["content"] = c + "\nTool results are present. Answer using them — do not call more tools.\n"
         msgs[idx] = m
     else:
         msgs.insert(0, {"role": "system", "content": tool_format.strip()})
@@ -679,13 +737,12 @@ def _augment_tool_system(messages, tools):
 
 def _normalize_messages(messages):
     """Convert OpenAI tool-call / tool-result messages back into the plain-text
-    shape the (non-native-tool) model understands, so multi-turn tool use works
-    instead of producing an incoherent context that makes generation stop
-    mid-answer. Editors never see this — only llama-server does.
+    shape the non-native-tool model understands. The model sees a linear
+    conversation: user → assistant(tool_call as text) → system(tool_result)
+    so it clearly knows the tool result is the response to its own call.
 
-    - assistant message with tool_calls  -> rendered as the fenced-JSON text the
-      model originally produced (preserving the call).
-    - role:"tool" result                 -> a user message: "Tool result for X: ...".
+    - assistant with tool_calls -> rendered as fenced-JSON text
+    - role:"tool" result      -> system message: [tool_result] content
     """
     id_name = {}
     out = []
@@ -701,20 +758,19 @@ def _normalize_messages(messages):
                 parts.append(str(m["content"]))
             for tc in m["tool_calls"]:
                 fn = tc.get("function") or {}
-                name = fn.get("name", "")
                 try:
                     args = json.loads(fn.get("arguments") or "{}")
                 except Exception:
                     args = fn.get("arguments", {})
-                parts.append("```json\n" + json.dumps({"name": name, "arguments": args},
-                                                       ensure_ascii=False) + "\n```")
+                parts.append("```json\n" + json.dumps({"name": fn.get("name",""), "arguments": args},
+                                                        ensure_ascii=False) + "\n```")
             out.append({"role": "assistant", "content": "\n".join(parts)})
         elif role == "tool":
             tcid = m.get("tool_call_id")
             name = id_name.get(tcid, "")
             content = m.get("content") or ""
-            out.append({"role": "user",
-                        "content": "Tool result%s:\n%s" % ((" for " + name) if name else "", content)})
+            prefix = "Here is the result of your %s call. Now answer the user's question:\n" % name if name else "Here is the tool result:\n"
+            out.append({"role": "user", "content": prefix + content})
         else:
             out.append(m)
     return out
