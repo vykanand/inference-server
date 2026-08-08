@@ -838,19 +838,10 @@ def _normalize_messages(messages):
                 fn = tc.get("function") or {}
                 if tc.get("id"):
                     id_name[tc["id"]] = fn.get("name", "")
-            parts = []
-            if m.get("content"):
-                parts.append(str(m["content"]))
-            for tc in m["tool_calls"]:
-                fn = tc.get("function") or {}
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except Exception:
-                    args = fn.get("arguments", {})
-                # Factual bracket format — does NOT look like model output.
-                # Prevents: model sees "Called bash(...)" → outputs "Called bash(...)"
-                parts.append("[called %s]" % (fn.get("name", "")))
-            out.append({"role": "assistant", "content": "\n".join(parts)})
+            # Don't put tool call text in history - models mimic any format.
+            # Tool results alone carry enough context. Assistant gets a
+            # minimal placeholder so message ordering is preserved.
+            out.append({"role": "assistant", "content": " "})
         elif role == "tool":
             tcid = m.get("tool_call_id")
             name = id_name.get(tcid, "")
