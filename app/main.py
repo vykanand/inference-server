@@ -850,9 +850,9 @@ def _normalize_messages(messages):
             # Distinguish success from error — model needs to know when a tool call failed
             is_error = any(w in str(content).lower()[:200] for w in ("error", "invalid", "failed", "cannot", "denied"))
             if is_error:
-                prefix = "ERROR: your %s call failed: " % name if name else "ERROR: your tool call failed: "
+                prefix = "[ERROR from %s] " % name if name else "[ERROR from tool] "
             else:
-                prefix = "Result of %s: " % name if name else "Result: "
+                prefix = "[result from %s]\n" % name if name else "[tool result]\n"
             out.append({"role": "user", "content": prefix + content})
         else:
             out.append(m)
@@ -1034,9 +1034,9 @@ async def v1_chat_completions(request: Request):
                 pass
             tool_hint = (
                 project_ctx +
-                "You have tools. ALWAYS call them to act — never ask the user to do anything.\n"
-                "Your FIRST response to ANY request must be a tool call, not text.\n"
-                "Only use text after receiving tool results to summarize findings.\n"
+                "You have tools. Call them to explore/modify the project.\n"
+                "Start every new task with a tool call — never describe what you'd do.\n"
+                "After seeing tool results, summarize findings in plain text.\n"
                 "Format: ```json\n{\"name\":\"<tool>\",\"arguments\":{...}}\n```\n"
                 "Available: %s.\n\n" % ", ".join(names[:15])
             )
@@ -1216,10 +1216,11 @@ async def v1_chat_completions(request: Request):
                                         if not saw_finish:
                                             yield _sse_chunk(finish="stop")
                                 else:
-                                    # No tool call detected. If we stopped live
-                                    # emission (false fence), emit buffered text.
-                                    if not live_emit:
-                                        yield _sse_chunk(content=full, finish="stop")
+                                    # No tool call detected. If live emission was
+                                    # stopped (false fence), emit ONLY finish.
+                                    # Content was already live-emitted progressively.
+                                    if not live_emit and not saw_finish:
+                                        yield _sse_chunk(finish="stop")
                                     elif not saw_finish:
                                         yield _sse_chunk(finish="stop")
                             else:
