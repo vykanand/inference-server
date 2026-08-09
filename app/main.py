@@ -617,10 +617,11 @@ def _canonicalize_tool_name(name, tools):
 def _parse_tool_call_obj(obj, tools):
     if not isinstance(obj, dict):
         return None
-    name = obj.get("name")
+    # Handle both "name" (OpenAI) and "function" (common model mistake)
+    name = obj.get("name") or obj.get("function")
     if not name or not isinstance(name, str):
         return None
-    args = obj.get("arguments")
+    args = obj.get("arguments") or obj.get("parameters") or {}
     if not isinstance(args, dict):
         args = {}
     return _canonicalize_tool_name(name, tools), args
@@ -668,7 +669,8 @@ def _extract_tool_calls(content, tools=None):
     m = _TOOL_FENCE_RE.match(text)
     src = m.group(1) if m else text
     if not m:
-        if not (text.startswith("{") and '"name"' in text) and not (text.startswith("[") and '"name"' in text):
+        if not (text.startswith("{") and ('"name"' in text or '"function"' in text)) and \
+           not (text.startswith("[") and ('"name"' in text or '"function"' in text)):
             return []
     # Try strict parse, then repair if broken JSON (common on Phi/1-4B models)
     try:
@@ -841,7 +843,7 @@ def _normalize_messages(messages):
             # Don't put tool call text in history - models mimic any format.
             # Tool results alone carry enough context. Assistant gets a
             # minimal placeholder so message ordering is preserved.
-            out.append({"role": "assistant", "content": " "})
+            out.append({"role": "assistant", "content": ""})
         elif role == "tool":
             tcid = m.get("tool_call_id")
             name = id_name.get(tcid, "")
