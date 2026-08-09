@@ -1068,7 +1068,19 @@ async def v1_chat_completions(request: Request):
             older = rest[:-keep_turns] if len(rest) > keep_turns else []
             recent = rest[-keep_turns:]
             if older:
-                summary = "[Earlier: %d message turns — model used tools and analyzed project]\n" % len(older)
+                # Build informative summary: what tools were called, key files
+                tool_uses = set()
+                for m in older:
+                    c = m.get("content") or ""
+                    # Extract tool names from normalized messages
+                    if isinstance(c, str) and "tool" in c.lower():
+                        for t in ("bash", "read", "edit", "glob", "grep", "write", "task"):
+                            if t in c:
+                                tool_uses.add(t)
+                summary = "[Context summary: %d earlier turns. " % len(older)
+                if tool_uses:
+                    summary += "Tools used: %s. " % ", ".join(sorted(tool_uses))
+                summary += "Continue from the last response above.]\n"
                 payload["messages"] = sysmsg + [{"role": "system", "content": summary}] + recent
             else:
                 payload["messages"] = sysmsg + recent
