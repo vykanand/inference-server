@@ -873,7 +873,14 @@ def _wrap_tool_calls(tcs, call_id=None):
     for i, (name, args) in enumerate(tcs):
         cid = "%s_%d" % (base_id, i) if len(tcs) > 1 else base_id
         if isinstance(args, dict):
-            args = {k: v for k, v in args.items() if v is not None}
+            # Recursive null strip — prevents schema errors from nested nulls
+            def _rnull(d):
+                if isinstance(d, dict):
+                    return {k: _rnull(v) for k, v in d.items() if v is not None}
+                if isinstance(d, list):
+                    return [_rnull(x) for x in d if x is not None]
+                return d
+            args = _rnull(args)
         out.append({"id": cid, "type": "function",
                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
     return out
