@@ -36,7 +36,7 @@ PARAM_SPEC = [
     {"key": "min_p", "label": "Min-P", "group": "Sampling", "cat": "accuracy", "type": "float",
      "min": 0, "max": 1, "step": 0.01, "default": 0.02, "help": "Filters only extreme noise tokens."},
     {"key": "repeat_penalty", "label": "Repeat penalty", "group": "Sampling", "cat": "accuracy", "type": "float",
-     "min": 1, "max": 2, "step": 0.01, "default": 1.02, "help": "1.02 = tiny dampening. Breaks repetition loops."},
+     "min": 1, "max": 2, "step": 0.01, "default": 1.05, "help": "1.05 dampens repeats. Prevents generation loops."},
     {"key": "mmap", "label": "Memory-mapped weights", "group": "Memory", "cat": "memory", "type": "bool",
      "default": True, "help": "mmap lets OS page weights in from disk as needed."},
     {"key": "mlock", "label": "Lock weights in RAM", "group": "Memory", "cat": "memory", "type": "bool",
@@ -136,7 +136,7 @@ def auto_tune(hw, file_size_mb, layers=None, ctx_limit=None):
     partial = layers and p["n_gpu_layers"] < layers
     p["mlock"] = bool(partial and ram_free_gb > 2)
     p["mmap"] = True
-    p["temp"], p["top_k"], p["top_p"], p["min_p"], p["repeat_penalty"] = 0.1, 20, 1.0, 0.02, 1.02
+    p["temp"], p["top_k"], p["top_p"], p["min_p"], p["repeat_penalty"] = 0.1, 20, 1.0, 0.02, 1.05
     return p
 
 
