@@ -1041,16 +1041,18 @@ async def v1_chat_completions(request: Request):
                 pass
             tool_hint = (
                 project_ctx +
-                "You have tools. Call them to explore/modify the project.\n"
-                "Start every new task with a tool call — never describe what you'd do.\n"
-                "After seeing tool results, summarize findings in plain text.\n"
-                "Format: ```json\n{\"name\":\"<tool>\",\"arguments\":{...}}\n```\n"
-                "Available: %s.\n\n" % ", ".join(names[:15])
+                "You have tools: %s.\n" % ", ".join(names[:15]) +
+                "Call tools using: {\"name\":\"<tool>\",\"arguments\":{...}}\n"
+                "Always take action first — never describe what you would do.\n\n"
             )
             if idx is not None:
-                if "tool-calling coding agent" not in str(messages[idx].get("content", "")):
-                    messages[idx] = dict(messages[idx])
-                    messages[idx]["content"] = tool_hint + str(messages[idx].get("content", ""))
+                # TRIM the system prompt — opencode's verbose instructions
+                # consume 17k+ tokens, leaving 0 room for conversation.
+                # Keep only first 500 chars + our directive.
+                orig = str(messages[idx].get("content", ""))
+                trimmed = orig[:500] + ("" if len(orig) <= 500 else "\n...[instructions trimmed for context space]")
+                messages[idx] = dict(messages[idx])
+                messages[idx]["content"] = tool_hint + trimmed
             else:
                 messages.insert(0, {"role": "system", "content": tool_hint.strip()})
         payload["messages"] = messages
