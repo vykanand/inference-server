@@ -1056,11 +1056,12 @@ async def v1_chat_completions(request: Request):
             # Keep system + last N messages that fit within budget
             sysmsg = [messages[0]] if messages and messages[0].get("role") == "system" else []
             rest = messages[1:] if sysmsg else list(messages)
+            sys_toks = _est_toks(sysmsg[0]) if sysmsg else 0
             kept = []
             total = 0
             for m in reversed(rest):
                 t = _est_toks(m)
-                if total + t > budget - (2 if sysmsg else 0):
+                if total + t + sys_toks > budget:
                     break
                 kept.insert(0, m)
                 total += t
