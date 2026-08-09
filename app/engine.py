@@ -400,7 +400,8 @@ class EngineManager:
         self.base_dir = base_dir
         self.engines = {}
         self._lock = threading.Lock()
-        self._cleanup_orphans()
+        if not os.environ.get("INFERENCE_NO_CLEANUP"):
+            self._cleanup_orphans()
         self._watchdog_thread = None
 
     def _cleanup_orphans(self):

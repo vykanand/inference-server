@@ -4,6 +4,7 @@ import re
 import threading
 import time
 import asyncio
+import difflib
 
 import requests
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -531,8 +532,16 @@ def _pick_engine(model):
     if not running:
         return None
     m = str(model or "")
+    # opencode/claude-code send "provider/model" — strip any provider prefix
+    if "/" in m:
+        m = m.split("/", 1)[1]
+    bare = ""
+    if "." in m:  # "qwen3.5-4b-super-coder.gguf" -> compare without extension
+        bare = m.rsplit(".", 1)[0]
     for e in running:
         if m and (e.model_name == m or str(e.port) == m or m in e.model_name):
+            return e
+        if bare and bare in e.model_name:
             return e
     return running[0]
 
@@ -554,26 +563,64 @@ def _ensure_engine(model_req):
     return manager.load(path, params, os.path.basename(path))
 
 
-def _proxy_completion(target, payload, model_req):
+def _proxy_completion(target, payload, model_req, eng=None, ctx_limit=4096):
     # Normalize OpenAI tool/tool-result messages for llama-server (no native
     # tool template) so non-streaming tool use also works across turns.
     msgs = payload.get("messages")
     if isinstance(msgs, list) and _has_tool_messages(msgs):
         payload["messages"] = _normalize_messages(msgs)
-    try:
-        r = requests.post(target, json=payload, timeout=600)
-    except Exception as e:
-        return 502, {"error": {"message": str(e)}}
-    try:
-        obj = r.json()
-    except Exception:
-        return r.status_code, {"error": {"message": r.text[:500]}}
-    if isinstance(obj, dict) and obj.get("model"):
+    port = eng.port if eng else 8081
+    obj = None
+    last_status = 502
+    for attempt in (0, 1, 2, 3):
+        try:
+            r = requests.post(target, json=payload, timeout=600)
+        except Exception as e:
+            return 502, {"error": {"message": str(e)}}
+        last_status = r.status_code
+        if r.status_code == 400:
+            err_text = r.text[:600]
+            if "context" in err_text.lower() or "exceed" in err_text.lower():
+                exact = None
+                try:
+                    j = json.loads(r.text)
+                    exact = (j.get("error") or {}).get("n_prompt_tokens")
+                except Exception:
+                    pass
+                msgs = payload.get("messages") or []
+                if isinstance(msgs, list) and len(msgs) > 1 and attempt < 3:
+                    if exact:
+                        try:
+                            prev = _prompt_tokens(port, msgs, payload.get("tools"))
+                            _calibrate(port, model_req, int(exact), prev)
+                        except Exception:
+                            pass
+                    budget = max(256, int(ctx_limit * 0.70)) - attempt * int(ctx_limit * 0.10)
+                    shrunk = _shrink_to_budget(port, msgs, max(256, budget), payload.get("tools"))
+                    if shrunk and isinstance(shrunk, list) and len(shrunk) <= len(msgs):
+                        payload["messages"] = shrunk
+                        _log("truncate", before=len(msgs), after=len(payload["messages"]),
+                             reason="ctx_400_ns", exact=exact, budget=budget)
+                        continue
+                return r.status_code, {"error": {"message": "llama-server %s: %s" % (r.status_code, err_text)}}
+        if r.status_code != 200:
+            try:
+                return r.status_code, r.json()
+            except Exception:
+                return r.status_code, {"error": {"message": r.text[:500]}}
+        try:
+            obj = r.json()
+            break
+        except Exception:
+            return r.status_code, {"error": {"message": r.text[:500]}}
+    if not isinstance(obj, dict):
+        return last_status, {"error": {"message": "non-JSON upstream response"}}
+    if obj.get("model"):
         obj["model"] = model_req
     # Many local GGUFs (e.g. Qwen2.5-Coder) emit a tool call as a fenced
     # ```json block instead of native tool_calls. Convert it so editors that
     # expect OpenAI tool_calls get a properly structured call.
-    if payload.get("tools") and isinstance(obj, dict):
+    if payload.get("tools"):
         obj = _convert_tool_text(obj, payload.get("tools"))
     # Sanitize model output — strip control/illegal characters from content
     if isinstance(obj, dict):
@@ -614,6 +661,10 @@ def _canonicalize_tool_name(name, tools):
         b = n.lower().replace("_", "").replace("-", "")
         if a == b or a in b or b in a:
             return n
+    # Single-character transposition/typo (reed -> read): use similarity.
+    close = difflib.get_close_matches(name, names, n=1, cutoff=0.72)
+    if close:
+        return close[0]
     return name
 
 
@@ -843,10 +894,17 @@ def _normalize_messages(messages):
                 fn = tc.get("function") or {}
                 if tc.get("id"):
                     id_name[tc["id"]] = fn.get("name", "")
-            # Don't put tool call text in history - models mimic any format.
-            # Tool results alone carry enough context. Assistant gets a
-            # minimal placeholder so message ordering is preserved.
-            out.append({"role": "assistant", "content": " "})
+            # Keep a compact record of what was CALLED so the model can join
+            # parallel results to their calls on the next turn (context
+            # continuity for multi-step agents) without any native-tool data
+            # that a text-only template might reject.
+            calls_txt = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function") or {}
+                nm = fn.get("name", "")
+                args = fn.get("arguments") or ""
+                calls_txt.append('{"name":"%s","arguments":%s}' % (nm, args))
+            out.append({"role": "assistant", "content": ("tool_call: " + " ".join(calls_txt)) if calls_txt else " "})
         elif role == "tool":
             tcid = m.get("tool_call_id")
             name = id_name.get(tcid, "")
@@ -980,6 +1038,138 @@ def _est_toks(m):
     return max(1, int(n / 1.5))
 
 
+# ── exact token measurement against the live llama.cpp tokenizer ──────────
+# The ONLY number that matters is what llama.cpp itself reports. Our char
+# heuristics (chars/1.5) undercount dense code/JSON (≈1 token/char for coder
+# models), which is exactly why a prompt "fits" our estimate but llama.cpp
+# hard-rejects it with `exceed_context_size_error`. So PRIOR to sending we
+# measure the true token count with the engine's own /tokenize endpoint, and
+# if llama still 400s we read its exact n_prompt_tokens to calibrate the
+# non-message overhead and shrink deterministically.
+_tokenize_cache = {}
+
+
+def _engine_tokenize(port, text):
+    """Exact token count of `text` via llama-server /tokenize. Cached."""
+    if not isinstance(text, str) or not text:
+        return 0
+    key = (port, text[-2000:])
+    hit = _tokenize_cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        r = requests.post(f"http://127.0.0.1:{port}/tokenize",
+                          json={"content": text[:64_000], "add_special": False}, timeout=15)
+        if r.status_code == 200:
+            n = len((r.json() or {}).get("tokens") or [])
+            if len(_tokenize_cache) > 256:
+                _tokenize_cache.clear()
+            _tokenize_cache[key] = n
+            return n
+    except Exception:
+        pass
+    return 0
+
+
+def _msg_render_tokens(port, m):
+    """Approximate the prompt tokens a normalized message contributes."""
+    c = m.get("content") or ""
+    n = _engine_tokenize(port, c)
+    if n <= 0:
+        n = max(1, len(str(c)) // 3)
+    for tc in (m.get("tool_calls") or []):
+        fn = tc.get("function") or {}
+        args = fn.get("arguments") or ""
+        n += _engine_tokenize(port, args) if args else 0
+    # call wrapper/sub-delimiters: tokens for role names, ids, braces
+    return n + 6
+
+
+def _prompt_overhead(port, tools):
+    """Non-message tokens: chat-template structure + tool/function schemas.
+    Measured once per (port, tool-set) and cached."""
+    if not tools:
+        return 96
+    try:
+        sig = (port, json.dumps(tools, sort_keys=True)[:4000])
+    except Exception:
+        sig = (port, "")
+    key = ("ovh",) + sig
+    hit = _tokenize_cache.get(key)
+    if hit is not None:
+        return hit
+    try:
+        n = _engine_tokenize(port, json.dumps(tools, sort_keys=True))
+        n += 96  # chat-template start/end tokens
+        _tokenize_cache[key] = n
+        return n
+    except Exception:
+        return 96 + len(tools) * 40
+
+
+def _calibrate(port, model_req, n_prompt, measured):
+    """Bump per-engine overhead calibration from the 400's exact n_prompt."""
+    if measured <= 0:
+        return
+    _CAL[port] = max(0, n_prompt - measured)
+
+
+_CAL = {}
+
+
+def _prompt_tokens(port, messages, tools):
+    """Best-known prompt length: calibrated exact message tokens + cached
+    template/tool overhead. Large messages measured per-item; not tokenized
+    again when identical (same truncated-key cache)."""
+    msgs = sum(_msg_render_tokens(port, m) for m in messages)
+    ovh = _prompt_overhead(port, tools) + _CAL.get(port, 0)
+    return msgs + ovh
+
+
+def _shrink_to_budget(port, messages, budget_tokens, tools):
+    """Deterministic shrink: keep the system prompt + most recent turns,
+    drop oldest messages one by one (tool-result runs kept whole) until the
+    measured total fits. If a SINGLE recent message still overflows, keep
+    only its head. Always returns (messages, list) whose measured count is
+    within `budget_tokens`."
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages or []
+    sysmsg = [messages[0]] if messages[0].get("role") == "system" else []
+    rest = messages[1:] if sysmsg else list(messages)
+
+    def total(msgs):
+        return _prompt_tokens(port, (sysmsg if sysmsg else []) + msgs, tools)
+
+    # if already fits, return as-is
+    if total(rest) <= budget_tokens:
+        return (sysmsg + rest) if sysmsg else rest
+
+    # drop oldest answering-from (never the last message)
+    out = list(rest)
+    guard = len(out)
+    while len(out) > 1 and total(out) > budget_tokens and guard:
+        # If the oldest of the remaining is a tool-run leader, drop run-whole
+        idx = 0
+        out = out[1:]
+        guard -= 1
+
+    # fall back: per-message head trim for the tail that still overflows
+    k = 0
+    while total(out) > budget_tokens and out:
+        big = out[-1] if out else {}
+        # truncate the last message head as far as needed
+        c = big.get("content") or ""
+        keep = max(200, len(c) // 2)
+        big = dict(big)
+        big["content"] = c[:keep].rstrip() + "\n…[cut to fit context window]"
+        out[-1] = big
+        k += 1
+        if k > 12:
+            break
+    return (sysmsg + out) if sysmsg else out
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def v1_chat_completions(request: Request):
@@ -1055,48 +1245,25 @@ async def v1_chat_completions(request: Request):
             else:
                 messages.insert(0, {"role": "system", "content": tool_hint.strip()})
         payload["messages"] = messages
-        # Session buffer: when ctx overflows, summarize old messages instead of
-        # dropping them. System prompt + last 6 turns always reach the model.
-        # Older conversation is replaced with a summary line so no context is
-        # truly lost — the model knows what happened before.
-        budget = int(ctx_limit * 0.95)
-        est = sum(_est_toks(m) for m in messages)
-        if est > budget:
-            sysmsg = [messages[0]] if messages and messages[0].get("role") == "system" else []
-            rest = messages[1:] if sysmsg else list(messages)
-            sys_toks = _est_toks(sysmsg[0]) if sysmsg else 0
-            # Always keep last 8 turns — the 400 fallback cuts further if needed
-            keep_turns = min(8, len(rest))
-            # Summarize older messages instead of dropping them
-            older = rest[:-keep_turns] if len(rest) > keep_turns else []
-            recent = rest[-keep_turns:]
-            if older:
-                # Build informative summary: what tools were called, key files
-                tool_uses = set()
-                for m in older:
-                    c = m.get("content") or ""
-                    # Extract tool names from normalized messages
-                    if isinstance(c, str) and "tool" in c.lower():
-                        for t in ("bash", "read", "edit", "glob", "grep", "write", "task"):
-                            if t in c:
-                                tool_uses.add(t)
-                summary = "[Context summary: %d earlier turns. " % len(older)
-                if tool_uses:
-                    summary += "Tools used: %s. " % ", ".join(sorted(tool_uses))
-                summary += "Continue from the last response above.]\n"
-                # Merge into the single leading system message. Inserting a second
-                # system message breaks strict templates (qwen3.5-super-coder
-                # raises "System message must be at the beginning").
-                if sysmsg:
-                    merged = dict(sysmsg[0])
-                    merged["content"] = str(merged.get("content", "")) + "\n\n" + summary
-                    payload["messages"] = [merged] + recent
-                else:
-                    payload["messages"] = [{"role": "system", "content": summary}] + recent
-            else:
-                payload["messages"] = sysmsg + recent
-            _log("truncate", before=len(messages), after=len(payload["messages"]),
-                 summarized=len(older), kept=len(recent))
+        # Session buffer: fit the prompt to the REAL engine context. We
+        # reserve output+overhead so llama.cpp NEVER sees a prompt that
+        # exceeds ctx. Uses the engine's exact tokenizer, not a char guess.
+        budget = max(256, int(ctx_limit * 0.80))   # leave room for generation
+        tools = payload.get("tools")
+        try:
+            measured = _prompt_tokens(eng.port, messages, tools)
+        except Exception:
+            measured = 0
+        if measured > budget or measured == 0:
+            # measured==0 => tokenizer unavailable; fall back to estimate
+            if measured == 0:
+                measured = sum(_est_toks(m) for m in messages)
+            if measured > budget:
+                shrunk = _shrink_to_budget(eng.port, messages, budget, tools)
+                if shrunk and isinstance(shrunk, list):
+                    payload["messages"] = shrunk
+                _log("truncate", before=len(messages), after=len(payload.get("messages") or []),
+                     budget=budget, measured=measured, state="exact")
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
@@ -1108,25 +1275,33 @@ async def v1_chat_completions(request: Request):
         content_chars = 0
         live_emit = True   # progressive streaming on; off when tool-call fence detected
         try:
-            for attempt in (0, 1):
+            for attempt in (0, 1, 2, 3):
                 buf.clear(); saw_native = False; saw_finish = None; live_emit = True
                 try:
                     with requests.post(target, json=payload, stream=True, timeout=600) as r:
                         if r.status_code != 200:
                             err_text = r.text[:600]
-                            if attempt == 0 and r.status_code == 400 and (
+                            if r.status_code == 400 and (
                                 "context" in err_text.lower() or "exceed" in err_text.lower()):
+                                # parse llama's EXACT n_prompt_tokens for calibration
+                                exact = None
+                                try:
+                                    j = json.loads(r.text)
+                                    exact = (j.get("error") or {}).get("n_prompt_tokens")
+                                except Exception:
+                                    pass
                                 msgs = payload.get("messages") or []
-                                if isinstance(msgs, list) and len(msgs) > 2:
-                                    sysmsg = [msgs[0]] if msgs and msgs[0].get("role") == "system" else []
-                                    rest = msgs[1:] if sysmsg else msgs
-                                    # Aggressive fallback: system + last 4 messages
-                                    keep = max(1, min(len(rest), 4))
-                                    payload["messages"] = sysmsg + rest[-keep:]
-                                    _log("truncate", before=len(msgs), after=len(payload["messages"]),
-                                         reason="ctx_400")
-                                    _log("truncate", kept=len(payload["messages"]), reason="ctx_400")
-                                    continue
+                                if isinstance(msgs, list) and len(msgs) > 1 and attempt < 2:
+                                    if exact:
+                                        prev = _prompt_tokens(eng.port, msgs, payload.get("tools"))
+                                        _calibrate(eng.port, model_req, int(exact), prev)
+                                    budget = max(256, int(ctx_limit * 0.70)) - attempt * int(ctx_limit * 0.1)
+                                    shrunk = _shrink_to_budget(eng.port, msgs, max(256, budget), payload.get("tools"))
+                                    if shrunk and isinstance(shrunk, list) and len(shrunk) < len(msgs) + 1:
+                                        payload["messages"] = shrunk
+                                        _log("truncate", before=len(msgs), after=len(payload["messages"]),
+                                             reason="ctx_400", exact=exact, budget=budget)
+                                        continue
                             yield _sse_err("llama-server %s: %s" % (r.status_code, err_text),
                                           "upstream_error" if r.status_code >= 500 else "invalid_request_error")
                             yield "data: [DONE]\n\n"
@@ -1210,6 +1385,10 @@ async def v1_chat_completions(request: Request):
                                 # else: already in buffering mode — accumulate only
                             if fr:
                                 saw_finish = fr
+                                if has_tools and saw_native and not c:
+                                    # Upstream finish chunk carries no delta —
+                                    # relay it so the client sees finish_reason.
+                                    yield "data: " + json.dumps(obj) + "\n\n"
 
                         # --- stream ended: emit final chunk ---
                         if has_tools and not saw_native:
@@ -1275,7 +1454,7 @@ async def v1_chat_completions(request: Request):
                                            "X-Context-Type": "openai-chat",
                                            "X-Model": eng.model_name or "local"})
 
-    status, obj = await run_in_threadpool(_proxy_completion, target, payload, model_req)
+    status, obj = await run_in_threadpool(_proxy_completion, target, payload, model_req, eng, ctx_limit)
     return JSONResponse(status_code=status, content=obj,
                         headers={"X-Context-Limit": str(ctx_limit),
                                   "X-Model": eng.model_name or "local"})
@@ -1318,6 +1497,103 @@ def config_chat(body: dict):
         yield f'event: done\ndata: {json.dumps({"changes": (block or {}).get("changes") or {}, "applied": applied})}\n\n'
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+def _build_tight_context(messages, budget):
+    """Fit messages into ~budget tokens WITHOUT losing the active task state.
+
+    Frontier-feel target for small (3-7B) models + tiny/large-but-not-infinite
+    contexts. Order of operations (each is a bigger hammer than the last):
+
+      1) Never drop the system prompt (tool protocol + cached task state).
+      2) Shrink any ONE oversized message (a `read` dump, huge bash output)
+         down to a bounded excerpt. This is the biggest lever — a single
+         5k-token file read would otherwise evict 4 turns of plan.
+      3) Keep the most recent turns VERBATIM — they are the active working
+         set (last tool call, its result, the next user instruction).
+      4) Only if still over budget, fold older tool turns into a short
+         "[done so far]" state line that preserves what was changed so the
+         model can continue a half-finished task instead of restarting.
+
+    Returns (messages, changed).
+    """
+    if not isinstance(messages, list) or len(messages) <= 1:
+        return messages, False
+    sysmsg = [messages[0]] if messages[0].get("role") == "system" else []
+    rest = messages[1:] if sysmsg else messages
+    changed = False
+    if sum(_est_toks(m) for m in messages) <= budget:
+        return messages, False
+
+    # 2) per-message hard cap (guards a giant read/bash dump from eating budget)
+    MAX_MSG_CHARS = int(budget * 1.4)   # token ~= character count so char cap≈1.4x budget
+    capped = []
+    for m in rest:
+        m = dict(m)
+        c = m.get("content")
+        if isinstance(c, str) and len(c) > MAX_MSG_CHARS:
+            keep = max(600, MAX_MSG_CHARS)
+            tailhint = ""
+            # keep the useful head; append a tail hint of what was cut
+            m["content"] = c[:keep] + "\n\n[… tool/file output truncated: dropped %d chars …]" % (len(c) - keep)
+            changed = True
+        capped.append(m)
+    rest = capped
+
+    if (_est_toks(sysmsg[0]) if sysmsg else 0) + sum(_est_toks(m) for m in rest) <= budget:
+        return (sysmsg + rest) if sysmsg else rest, changed
+
+    # 3) keep the last K=4 turns verbatim (active work), older ones collapsible
+    KEEP = 4
+    recent = rest[-KEEP:] if len(rest) > KEEP else rest
+    older = rest[:-len(recent)]
+
+    # 4) fold older tool turns into a state line that preserves what changed
+    state_bits = []
+    edits = 0
+    errors = 0
+    files_touched = set()
+    tools_ran = set()
+    for m in older:
+        c = str(m.get("content") or "")
+        if m.get("role") == "assistant" and m.get("content"):
+            edits += 1
+        if c.startswith("[result from") or "[ERROR from" in c:
+            for t in ("bash", "read", "grep", "glob", "edit", "write", "todowrite", "task"):
+                if t in c:
+                    tools_ran.add(t)
+                    if t in ("edit", "write"):
+                        edits += 1
+                    break
+            if "[ERROR" in c or "error" in c.lower()[:300]:
+                errors += 1
+            m2 = re.search(r"(?:[A-Z]:\\)?[^\\\n ]*[\\/][\w.\- ]+", c)
+            if m2:
+                files_touched.add(m2.group(0)[:60])
+    if tools_ran:
+        state_bits.append("done so far: tools %s%s%s" % (
+            ", ".join(sorted(tools_ran)),
+            ", %d edits" % edits if edits else "",
+            ", %d errors" % errors if errors else ""))
+    if files_touched:
+        state_bits.append("files: " + ", ".join(sorted(files_touched)[:6]))
+    if not state_bits:
+        state_bits.append("done so far: see previous turns")
+    state = "[done so far] " + " | ".join(state_bits) + " — continue from the last response above.\n"
+
+    while sum(_est_toks(m) for m in older) + sum(_est_toks(m) for m in recent) + \
+            _est_toks({"content": state}) + (_est_toks(sysmsg[0]) if sysmsg else 0) > budget and len(older) > 1:
+        older = older[1:]
+        changed = True
+    # Merge the state line INTO the single system message — a second system
+    # role breaks strict templates (qwen3.5-super-coder raises).
+    if sysmsg:
+        merged = dict(sysmsg[0])
+        merged["content"] = str(merged.get("content", "")) + "\n\n" + state
+        payload = [merged] + older + recent
+    else:
+        payload = [{"role": "system", "content": state}] + older + recent
+    return payload, True
 
 
 def _extract_json(text):
