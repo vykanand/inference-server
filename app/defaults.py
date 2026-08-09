@@ -28,15 +28,15 @@ PARAM_SPEC = [
     {"key": "cache_reuse", "label": "Prompt cache reuse", "group": "KV cache", "cat": "performance", "type": "bool",
      "default": True, "help": "Reuse cached KV across requests with same prefix. Big speed win for editors/tools."},
     {"key": "temp", "label": "Temperature", "group": "Sampling", "cat": "accuracy", "type": "float",
-     "min": 0, "max": 2, "step": 0.01, "default": 0.15, "help": "0.15 = tiny variety. Breaks loops but stays predictable."},
+     "min": 0, "max": 2, "step": 0.01, "default": 0.1, "help": "0.1 = near-deterministic. Breaks loops, keeps tool JSON."},
     {"key": "top_k", "label": "Top-K", "group": "Sampling", "cat": "accuracy", "type": "int",
-     "min": 1, "max": 100, "step": 1, "default": 40, "help": "Keep top K tokens. 40 = good variety for coding."},
+     "min": 1, "max": 100, "step": 1, "default": 20, "help": "Top K tokens. 20 = focused, prevents rambling."},
     {"key": "top_p", "label": "Top-P", "group": "Sampling", "cat": "accuracy", "type": "float",
-     "min": 0, "max": 1, "step": 0.01, "default": 0.9, "help": "Nucleus sampling. Trims bottom 10% chaos tokens."},
+     "min": 0, "max": 1, "step": 0.01, "default": 1.0, "help": "Nucleus. 1=disabled. Tool calls need this off."},
     {"key": "min_p", "label": "Min-P", "group": "Sampling", "cat": "accuracy", "type": "float",
-     "min": 0, "max": 1, "step": 0.01, "default": 0.05, "help": "Cut low-probability tokens."},
+     "min": 0, "max": 1, "step": 0.01, "default": 0.02, "help": "Filters only extreme noise tokens."},
     {"key": "repeat_penalty", "label": "Repeat penalty", "group": "Sampling", "cat": "accuracy", "type": "float",
-     "min": 1, "max": 2, "step": 0.01, "default": 1.0, "help": "Damp repeats."},
+     "min": 1, "max": 2, "step": 0.01, "default": 1.02, "help": "1.02 = tiny dampening. Breaks repetition loops."},
     {"key": "mmap", "label": "Memory-mapped weights", "group": "Memory", "cat": "memory", "type": "bool",
      "default": True, "help": "mmap lets OS page weights in from disk as needed."},
     {"key": "mlock", "label": "Lock weights in RAM", "group": "Memory", "cat": "memory", "type": "bool",
@@ -136,7 +136,7 @@ def auto_tune(hw, file_size_mb, layers=None, ctx_limit=None):
     partial = layers and p["n_gpu_layers"] < layers
     p["mlock"] = bool(partial and ram_free_gb > 2)
     p["mmap"] = True
-    p["temp"], p["top_k"], p["top_p"], p["min_p"], p["repeat_penalty"] = 0.15, 40, 0.9, 0.05, 1.0
+    p["temp"], p["top_k"], p["top_p"], p["min_p"], p["repeat_penalty"] = 0.1, 20, 1.0, 0.02, 1.02
     return p
 
 
