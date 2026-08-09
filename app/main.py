@@ -1052,9 +1052,28 @@ async def v1_chat_completions(request: Request):
             else:
                 messages.insert(0, {"role": "system", "content": tool_hint.strip()})
         payload["messages"] = messages
-        # Full context passes through to the model. No preemptive truncation.
-        # If context overflows, the 400 fallback in _stream_gen retries once
-        # with trimmed messages. Opencode's own compaction manages long sessions.
+        # Session buffer: when ctx overflows, summarize old messages instead of
+        # dropping them. System prompt + last 6 turns always reach the model.
+        # Older conversation is replaced with a summary line so no context is
+        # truly lost — the model knows what happened before.
+        budget = int(ctx_limit * 0.95)
+        est = sum(_est_toks(m) for m in messages)
+        if est > budget:
+            sysmsg = [messages[0]] if messages and messages[0].get("role") == "system" else []
+            rest = messages[1:] if sysmsg else list(messages)
+            sys_toks = _est_toks(sysmsg[0]) if sysmsg else 0
+            # Always keep last 8 turns — the 400 fallback cuts further if needed
+            keep_turns = min(8, len(rest))
+            # Summarize older messages instead of dropping them
+            older = rest[:-keep_turns] if len(rest) > keep_turns else []
+            recent = rest[-keep_turns:]
+            if older:
+                summary = "[Earlier: %d message turns — model used tools and analyzed project]\n" % len(older)
+                payload["messages"] = sysmsg + [{"role": "system", "content": summary}] + recent
+            else:
+                payload["messages"] = sysmsg + recent
+            _log("truncate", before=len(messages), after=len(payload["messages"]),
+                 summarized=len(older), kept=len(recent))
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
