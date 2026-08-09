@@ -843,12 +843,11 @@ def _normalize_messages(messages):
             # Don't put tool call text in history - models mimic any format.
             # Tool results alone carry enough context. Assistant gets a
             # minimal placeholder so message ordering is preserved.
-            out.append({"role": "assistant", "content": ""})
+            out.append({"role": "assistant", "content": " "})
         elif role == "tool":
             tcid = m.get("tool_call_id")
             name = id_name.get(tcid, "")
-            content = m.get("content") or ""
-            # Distinguish success from error — model needs to know when a tool call failed
+            content = _sanitize_content(m.get("content") or "")
             is_error = any(w in str(content).lower()[:200] for w in ("error", "invalid", "failed", "cannot", "denied"))
             if is_error:
                 prefix = "[ERROR from %s] " % name if name else "[ERROR from tool] "
