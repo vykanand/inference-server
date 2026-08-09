@@ -3,14 +3,14 @@
 
 def add(a: int, b: int) -> int:
     """Return the sum of a and b."""
-    return a - b
+    return a + b
 
 
 def multiply(a: int, b: int) -> int:
     """Return the product of a and b."""
-    return a + b
+    return a * b
 
 
 def is_even(n: int) -> bool:
     """Return True if n is even."""
-    return n % 2 == 1
+    return n % 2 == 0
