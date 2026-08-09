@@ -183,7 +183,7 @@ function engCard(e) {
   const fit = e.gpu_fit_pct != null ? Math.round(e.gpu_fit_pct) + "%" : "?";
   const vramTxt = e.vram_used_engine_mb ? ` ≈${mb(e.vram_used_engine_mb)} live` : "";
   const c = e.connect || {};
-  return `<div class="card">
+  return `<div class="card" data-port="${e.port}">
     <div class="d">PORT <b>${e.port}</b> <span class="status-dot ${dot}"></span> ${e.ready ? "ready" : (e.running ? "loading" : "stopped")}${e.pid ? " · pid " + e.pid : ""}</div>
     <div class="t">${esc(e.model_name)}</div>
     <div class="row">
@@ -249,9 +249,14 @@ function fitLabel(e) {
   return r >= 0.995 ? "full (100%)" : r >= 0.5 ? `split (${Math.round(r * 100)}%)` : `partial (${Math.round(r * 100)}%)`;
 }
 function renderEngines() {
+  // Preserve open state of connect-box dropdowns across renders
+  const open = new Set();
+  $$(".connect-box.open").forEach(el => { const p = el.closest("[data-port]"); if (p) open.add(p.dataset.port); });
   $("#engineList").innerHTML = engines.length
     ? engines.map(engCard).join("")
-    : '<div class="muted">No engines running. Click “Load Model”.</div>';
+    : '<div class="muted">No engines running. Click "Load Model".</div>';
+  // Restore open state
+  open.forEach(port => { const el = document.querySelector(`[data-port="${port}"] .connect-box`); if (el) el.classList.add("open"); });
   $("#engineCount").textContent = engines.length;
 }
 function fillSelects() {
