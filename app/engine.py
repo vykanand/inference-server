@@ -472,14 +472,17 @@ class EngineManager:
                 port = sorted(self.engines.keys())[0]
         return self.engines.get(port)
 
-    def create(self):
+    def create(self, port=None):
         with self._lock:
-            eng = Engine(self.base_dir)
+            eng = Engine(self.base_dir, port=port)
             self.engines[eng.port] = eng
             return eng
 
-    def load(self, model_path, params, model_name=None):
-        eng = self.create()
+    def load(self, model_path, params, model_name=None, port=None):
+        # If a port is specified, stop any engine on that port first
+        if port is not None:
+            self.stop(port)
+        eng = self.create(port)
         st = eng.start(model_path, params, model_name)
         if not st["ready"]:
             self.stop(eng.port)

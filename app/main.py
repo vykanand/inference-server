@@ -227,7 +227,10 @@ def load(body: dict):
     layers = meta.get("block_count") or params.get("n_gpu_layers")
     if params.get("n_gpu_layers") and params["n_gpu_layers"] > layers:
         params["n_gpu_layers"] = layers if layers else params["n_gpu_layers"]
-    eng = manager.load(path, params, name)
+    # Reuse existing engine port if one is running — always load on same port
+    existing = next((e for e in manager.list() if e.get("running")), None)
+    reuse_port = int(existing["port"]) if existing else None
+    eng = manager.load(path, params, name, port=reuse_port)
     eng.info.setdefault("layers_total", layers)
     out = eng.status()
     out["_info"] = {"layers": layers, "meta": meta}
