@@ -17,7 +17,7 @@ import json
 # Port the inference-server (FastAPI) proxy listens on. External tools such as
 # opencode / Claude Code / Cline must point here (NOT the raw llama-server port)
 # so context-window overflow is auto-truncated. start.py sets PORT env before launch.
-SERVER_PORT = int(os.environ.get("PORT", "8899"))
+SERVER_PORT = int(os.environ.get("PORT", "8080"))
 
 
 def read_pids():

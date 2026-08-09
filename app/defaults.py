@@ -136,7 +136,7 @@ def auto_tune(hw, file_size_mb, layers=None, ctx_limit=None):
     partial = layers and p["n_gpu_layers"] < layers
     p["mlock"] = bool(partial and ram_free_gb > 2)
     p["mmap"] = True
-    p["temp"], p["top_k"], p["top_p"], p["min_p"], p["repeat_penalty"] = 0.1, 20, 1.0, 0.02, 1.05
+    p["temp"], p["top_k"], p["top_p"], p["min_p"], p["repeat_penalty"] = 0.2, 25, 0.95, 0.05, 1.08
     return p
 
 

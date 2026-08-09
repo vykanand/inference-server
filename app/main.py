@@ -230,7 +230,7 @@ def load(body: dict):
         params["n_gpu_layers"] = layers if layers else params["n_gpu_layers"]
     # Reuse existing engine port if one is running — always load on same port
     existing = next((e for e in manager.list() if e.get("running")), None)
-    reuse_port = int(existing["port"]) if existing else None
+    reuse_port = int(existing["port"]) if existing else 8081
     eng = manager.load(path, params, name, port=reuse_port)
     eng.info.setdefault("layers_total", layers)
     out = eng.status()
@@ -1274,11 +1274,13 @@ async def v1_chat_completions(request: Request):
         chunk_count = 0
         content_chars = 0
         live_emit = True   # progressive streaming on; off when tool-call fence detected
+        emitted_any = False  # any byte already sent to the client this request
         try:
             for attempt in (0, 1, 2, 3):
                 buf.clear(); saw_native = False; saw_finish = None; live_emit = True
                 try:
-                    with requests.post(target, json=payload, stream=True, timeout=600) as r:
+                    with requests.post(target, json=payload, stream=True,
+                                       timeout=(30, 900)) as r:
                         if r.status_code != 200:
                             err_text = r.text[:600]
                             if r.status_code == 400 and (
@@ -1323,6 +1325,7 @@ async def v1_chat_completions(request: Request):
                             d = raw[5:].strip()
                             if d == "[DONE]":
                                 continue
+                            emitted_any = True
 
                             # --- non-tool path: relay raw SSE directly ---
                             if not has_tools:
@@ -1346,7 +1349,10 @@ async def v1_chat_completions(request: Request):
                             try:
                                 obj = json.loads(d)
                             except Exception:
-                                yield _sse_err("invalid JSON: %s" % str(raw)[:200], "invalid_response_error")
+                                # A malformed frame mid-stream (partial split) must
+                                # NOT kill the turn or inject an error event into an
+                                # otherwise-good stream — skip it and keep going.
+                                _log("sse_skip", raw=raw[:120])
                                 continue
                             if isinstance(obj, dict) and obj.get("model"):
                                 obj["model"] = model_req
@@ -1436,8 +1442,32 @@ async def v1_chat_completions(request: Request):
                                 yield _sse_chunk(finish="stop")
                         break  # success — exit retry loop
                 except Exception as e:
-                    if attempt == 1:
-                        yield _sse_err(str(e), "server_error")
+                    _log("stream_err", attempt=attempt, emitted=emitted_any, err=str(e)[:200])
+                    if emitted_any:
+                        # Upstream died mid-stream. NEVER replay — the client already
+                        # received chunks; re-posting would corrupt the turn with a
+                        # second draft. Salvage the buffer so the tool call / text is
+                        # not lost, then end the turn cleanly with a finish_reason.
+                        if has_tools and not saw_native:
+                            full = "".join(buf)
+                            if full:
+                                seg = _split_tool_and_text(full, tools)
+                                if seg:
+                                    _, tcs, _ = seg
+                                    valid_tcs = [(n, a) for n, a in tcs if n in _tool_names(tools)]
+                                    if valid_tcs:
+                                        yield _sse_chunk(tool_calls=_wrap_tool_calls(valid_tcs))
+                                        yield _sse_chunk(finish="tool_calls")
+                                    elif full.strip():
+                                        yield _sse_chunk(content=full.strip(), finish="stop")
+                        if not saw_finish:
+                            yield _sse_chunk(finish="stop")
+                        _log("response", model=model_req, interrupted=True, error=True,
+                             chunks=chunk_count, dur_s=round(time.time() - _req_start, 2))
+                        break
+                    if attempt == 3:
+                        yield _sse_err("upstream stream failed: %s" % e, "upstream_error")
+                    time.sleep(0.5)  # engine may be restarting — brief backoff
             yield "data: [DONE]\n\n"
         except Exception as e:
             yield _sse_err(str(e), "server_error")

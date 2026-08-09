@@ -27,7 +27,7 @@ sys.path.insert(0, r"C:\dev\inference-server")
 
 from app.main import _repair_json, _extract_tool_calls, _canonicalize_tool_name  # noqa: E402
 
-SERVER = "http://127.0.0.1:8899/v1"
+SERVER = "http://127.0.0.1:8080/v1"
 URL = SERVER + "/chat/completions"
 
 TOOLS = [

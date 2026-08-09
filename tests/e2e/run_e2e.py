@@ -24,7 +24,7 @@ import urllib.request
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SAMPLE = os.path.join(ROOT, "sample_bug")
 WORK = os.path.join(ROOT, "work")
-SERVER = "http://127.0.0.1:8899"
+SERVER = "http://127.0.0.1:8080"
 DEFAULT_MODEL = "opencode-local/qwen3.5-4b-super-coder"
 TASK = (
     "The unit tests in this project are failing. "

@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Model Sources</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f5f7fa; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .container { max-width: 900px; width: 100%; padding: 20px; }
+    h1 { text-align: center; color: #333; margin-bottom: 30px; font-size: 24px; }
+    .sources { display: grid; gap: 16px; }
+    .source-card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); transition: transform 0.2s, box-shadow 0.2s; }
+    .source-card:hover { transform: translateY(-2px); box-shadow: 0 4px 6px rgba(0,0,0,0.15); }
+    .source-card h3 { color: #333; margin-bottom: 8px; font-size: 16px; }
+    .source-card p { color: #666; font-size: 14px; line-height: 1.5; margin-bottom: 12px; }
+    .source-card a { display: inline-block; padding: 8px 16px; background: #3b82f6; color: white; text-decoration: none; border-radius: 6px; font-size: 14px; }
+    .source-card a:hover { background: #2563eb; }
+    .loading { text-align: center; padding: 40px; color: #666; }
+    .error { color: #ef4444; text-align: center; padding: 40px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>AI Model Sources</h1>
+    <div id="sources" class="sources"></div>
+    <p id="loading" class="loading">Loading models...</p>
+    <p id="error" class="error"></p>
+  </div>
+
+  <script>
+    async function loadModels() {
+      const sources = [];
+      try {
+        // Open-Source AI Hubs
+        const oaahResponse = await fetch('https://api.openaiahub.com/api/models');
+        if (oaahResponse.ok) sources.push(await oaahResponse.json());
+
+        // Hugging Face
+        const hfResponse = await fetch('https://huggingface.co/api/models?filter=license&license=Apache-2.0');
+        if (hfResponse.ok) sources.push(await hfResponse.json());
+
+        // ModelZoo
+        const mzResponse = await fetch('https://modelzoo.ai/api/models');
+        if (mzResponse.ok) sources.push(await mzResponse.json());
+
+        // GitHub
+        const ghResponse = await fetch('https://api.github.com/search/code?q=ai+model+weights');
+        if (ghResponse.ok) sources.push(await ghResponse.json());
+
+        // GitLab
+        const glResponse = await fetch('https://gitlab.com/api/v4/projects?search=ai+model+weights');
+        if (glResponse.ok) sources.push(await glResponse.json());
+
+        // Codeberg
+        const cbResponse = await fetch('https://codeberg.org/api/v1/search?query=ai+model+weights');
+        if (cbResponse.ok) sources.push(await cbResponse.json());
+      } catch (e) {
+        console.error(e);
+        document.getElementById('error').textContent = 'Failed to load models. Check your internet connection.';
+      }
+
+      const container = document.getElementById('sources');
+      document.getElementById('loading').style.display = 'none';
+      if (sources.length > 0) {
+        sources.forEach(async (source) => {
+          try {
+            const response = await fetch(source.url);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            const card = document.createElement('div');
+            card.className = 'source-card';
+            card.innerHTML = `
+              <h3>${source.name || source.title}</h3>
+              <p>${source.description || 'No description available.'}</p>
+              <a href="${source.url}" target="_blank">View ${source.name || source.title} â</a>
+            `;
+            container.appendChild(card);
+          } catch (e) {
+            console.error(`Failed to load ${source.name}:`, e);
+          }
+        });
+      } else {
+        document.getElementById('error').textContent = 'No models found from any source.';
+      }
+    }
+
+    loadModels();
+  </script>
+</body>
+</html>
+```
+
+<tool_call>
+<function=bash>
+<parameter=command>
+cd "C:\dev\inference-server\models-sources" && dir
