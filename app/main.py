@@ -1084,7 +1084,15 @@ async def v1_chat_completions(request: Request):
                 if tool_uses:
                     summary += "Tools used: %s. " % ", ".join(sorted(tool_uses))
                 summary += "Continue from the last response above.]\n"
-                payload["messages"] = sysmsg + [{"role": "system", "content": summary}] + recent
+                # Merge into the single leading system message. Inserting a second
+                # system message breaks strict templates (qwen3.5-super-coder
+                # raises "System message must be at the beginning").
+                if sysmsg:
+                    merged = dict(sysmsg[0])
+                    merged["content"] = str(merged.get("content", "")) + "\n\n" + summary
+                    payload["messages"] = [merged] + recent
+                else:
+                    payload["messages"] = [{"role": "system", "content": summary}] + recent
             else:
                 payload["messages"] = sysmsg + recent
             _log("truncate", before=len(messages), after=len(payload["messages"]),
