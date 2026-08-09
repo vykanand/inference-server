@@ -1054,9 +1054,10 @@ async def v1_chat_completions(request: Request):
             else:
                 messages.insert(0, {"role": "system", "content": tool_hint.strip()})
         payload["messages"] = messages
-        # Preemptive truncation: ensure prompt fits before sending. Uses 80% of
-        # ctx so there's always headroom. Preserves system + most recent turns.
-        budget = int(ctx_limit * 0.85)
+        # Use full ctx minus tiny reserve for generation. The 400 fallback
+        # handles actual overflow. Preemptive truncation was too aggressive
+        # because system prompt estimates eat most of the budget.
+        budget = int(ctx_limit * 0.95)
         messages = payload["messages"]
         est = sum(_est_toks(m) for m in messages)
         if est > budget:
@@ -1074,7 +1075,7 @@ async def v1_chat_completions(request: Request):
                 total += t
             payload["messages"] = sysmsg + kept
             _log("truncate", before=len(messages), after=len(payload["messages"]),
-                 est_tokens=est, budget=budget)
+                 est_tokens=est, budget=budget, sys_toks=sys_toks)
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
