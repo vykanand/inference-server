@@ -1046,38 +1046,15 @@ async def v1_chat_completions(request: Request):
                 "Always take action first — never describe what you would do.\n\n"
             )
             if idx is not None:
-                # TRIM the system prompt — opencode's verbose instructions
-                # consume 17k+ tokens, leaving 0 room for conversation.
-                # Keep only first 500 chars + our directive.
-                orig = str(messages[idx].get("content", ""))
-                trimmed = orig[:500] + ("" if len(orig) <= 500 else "\n...[instructions trimmed for context space]")
                 messages[idx] = dict(messages[idx])
-                messages[idx]["content"] = tool_hint + trimmed
+                if "You have tools:" not in str(messages[idx].get("content", "")):
+                    messages[idx]["content"] = tool_hint + str(messages[idx].get("content", ""))
             else:
                 messages.insert(0, {"role": "system", "content": tool_hint.strip()})
         payload["messages"] = messages
-        # Use full ctx minus tiny reserve for generation. The 400 fallback
-        # handles actual overflow. Preemptive truncation was too aggressive
-        # because system prompt estimates eat most of the budget.
-        budget = int(ctx_limit * 0.95)
-        messages = payload["messages"]
-        est = sum(_est_toks(m) for m in messages)
-        if est > budget:
-            # Keep system + last N messages that fit within budget
-            sysmsg = [messages[0]] if messages and messages[0].get("role") == "system" else []
-            rest = messages[1:] if sysmsg else list(messages)
-            sys_toks = _est_toks(sysmsg[0]) if sysmsg else 0
-            kept = []
-            total = 0
-            for m in reversed(rest):
-                t = _est_toks(m)
-                if total + t + sys_toks > budget:
-                    break
-                kept.insert(0, m)
-                total += t
-            payload["messages"] = sysmsg + kept
-            _log("truncate", before=len(messages), after=len(payload["messages"]),
-                 est_tokens=est, budget=budget, sys_toks=sys_toks)
+        # Full context passes through to the model. No preemptive truncation.
+        # If context overflows, the 400 fallback in _stream_gen retries once
+        # with trimmed messages. Opencode's own compaction manages long sessions.
 
     def _stream_gen():
         has_tools = bool(payload.get("tools"))
