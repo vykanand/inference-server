@@ -1171,10 +1171,12 @@ async def v1_chat_completions(request: Request):
                                     yield "data: " + json.dumps(obj) + "\n\n"
                                 elif live_emit:
                                     trailing = "".join(buf)[-200:]
-                                    if "```json" in trailing:
+                                    # Buffer backticks — emitting them live causes
+                                    # opencode to render empty code blocks (blank boxes)
+                                    if "```json" in trailing or "```" in c:
                                         live_emit = False
-                                    else:
-                                        yield _sse_chunk(content=c)
+                                        continue
+                                    yield _sse_chunk(content=c)
                                 # else: already in buffering mode — accumulate only
                             if fr:
                                 saw_finish = fr
